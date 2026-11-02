@@ -1,0 +1,47 @@
+px4ctrl:
+  ros__parameters:
+    use_sim_time: true
+    planner_frame: lidar
+    command_topic: /drone_0_planning/pos_cmd
+    odom_topic: /fastlio2/lio_odom
+    px4_status_topic: /fmu/out/vehicle_status_v4
+    px4_attitude_topic: /fmu/out/vehicle_attitude
+    px4_local_position_topic: /fmu/out/vehicle_local_position_v1
+    offboard_control_mode_topic: /fmu/in/offboard_control_mode
+    attitude_setpoint_topic: /fmu/in/vehicle_attitude_setpoint_v1
+    vehicle_command_topic: /fmu/in/vehicle_command
+    status_topic: /px4ctrl/status
+    manual_yaw_topic: /px4ctrl/manual_yaw
+    clear_manual_yaw_topic: /px4ctrl/clear_manual_yaw
+    publish_rate_hz: 100.0
+    state_timeout_sec: 0.30
+    command_timeout_sec: 0.50
+    prestream_seconds: 1.0
+    start_offboard_on_first_command: true
+    arm_on_first_command: true
+    gravity_mps2: 9.81
+    # Measured equilibrium output for X500 + gimbal + MID-360 in SITL.
+    hover_thrust: 0.864
+    min_thrust: 0.08
+    max_thrust: 0.95
+    max_tilt_deg: 30.0
+    max_acceleration_mps2: 4.0
+    local_position_timeout_sec: 0.50
+    require_local_position_valid: true
+    max_local_position_m: 100.0
+    max_local_velocity_mps: 15.0
+    land_on_safety_fault: true
+    auto_takeoff_altitude_m: 0.50
+    minimum_takeoff_altitude_m: 0.25
+    takeoff_duration_sec: 3.0
+    takeoff_tolerance_m: 0.08
+    hover_settle_sec: 0.80
+    hover_velocity_tolerance_mps: 0.15
+    kp: [1.5, 1.5, 1.8]
+    kv: [1.2, 1.2, 1.4]
+    # planner lidar frame -> PX4 local NED frame
+    transform_rotation_row_major: [
+      0.0, 1.0, 0.0,
+      1.0, 0.0, 0.0,
+      0.0, 0.0, -1.0
+    ]

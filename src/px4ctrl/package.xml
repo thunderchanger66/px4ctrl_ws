@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>px4ctrl</name>
+  <version>0.1.0</version>
+  <description>ROS 2 geometric attitude and thrust controller for EGO trajectories.</description>
+  <maintainer email="thunder@example.com">GRA</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>px4_msgs</depend>
+  <depend>quadrotor_msgs</depend>
+  <depend>Eigen3</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ego_planner</exec_depend>
+  <exec_depend>fastlio2_px4_odom_bridge</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
