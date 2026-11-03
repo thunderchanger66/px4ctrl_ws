@@ -38,12 +38,14 @@ struct DesiredState
   Vector3 velocity{Vector3::Zero()};
   Vector3 acceleration{Vector3::Zero()};
   double yaw{0.0};
+  double yaw_rate{0.0};
 };
 
 struct ControlOutput
 {
   Eigen::Quaterniond attitude{Eigen::Quaterniond::Identity()};
   double thrust{0.5};
+  double yaw_rate{0.0};
 };
 
 enum class ControlState
@@ -93,9 +95,13 @@ public:
     declare_parameter("max_tilt_deg", 30.0);
     declare_parameter("max_acceleration_mps2", 4.0);
     declare_parameter("local_position_timeout_sec", 0.50);
+    declare_parameter("max_ekf_reset_delta_m", 1.0);
+    declare_parameter("max_ekf_reset_heading_rad", 0.35);
     declare_parameter("require_local_position_valid", true);
     declare_parameter("max_local_position_m", 100.0);
     declare_parameter("max_local_velocity_mps", 15.0);
+    declare_parameter("align_to_px4_local_origin", true);
+    declare_parameter("frame_alignment_velocity_tolerance_mps", 0.20);
     declare_parameter("land_on_safety_fault", true);
     declare_parameter("auto_takeoff_altitude_m", 0.50);
     declare_parameter("minimum_takeoff_altitude_m", 0.25);
@@ -103,6 +109,8 @@ public:
     declare_parameter("takeoff_tolerance_m", 0.08);
     declare_parameter("hover_settle_sec", 0.80);
     declare_parameter("hover_velocity_tolerance_mps", 0.15);
+    declare_parameter("tracking_handoff_sec", 0.75);
+    declare_parameter("max_yaw_rate_radps", 1.5);
     declare_parameter("kp", std::vector<double>{1.5, 1.5, 1.8});
     declare_parameter("kv", std::vector<double>{1.2, 1.2, 1.4});
     declare_parameter("transform_rotation_row_major", std::vector<double>{
@@ -121,9 +129,14 @@ public:
     max_tilt_rad_ = get_parameter("max_tilt_deg").as_double() * M_PI / 180.0;
     max_acceleration_ = get_parameter("max_acceleration_mps2").as_double();
     local_position_timeout_sec_ = get_parameter("local_position_timeout_sec").as_double();
+    max_ekf_reset_delta_m_ = get_parameter("max_ekf_reset_delta_m").as_double();
+    max_ekf_reset_heading_rad_ = get_parameter("max_ekf_reset_heading_rad").as_double();
     require_local_position_valid_ = get_parameter("require_local_position_valid").as_bool();
     max_local_position_m_ = get_parameter("max_local_position_m").as_double();
     max_local_velocity_mps_ = get_parameter("max_local_velocity_mps").as_double();
+    align_to_px4_local_origin_ = get_parameter("align_to_px4_local_origin").as_bool();
+    frame_alignment_velocity_tolerance_mps_ =
+      get_parameter("frame_alignment_velocity_tolerance_mps").as_double();
     land_on_safety_fault_ = get_parameter("land_on_safety_fault").as_bool();
     auto_takeoff_altitude_m_ = get_parameter("auto_takeoff_altitude_m").as_double();
     minimum_takeoff_altitude_m_ = get_parameter("minimum_takeoff_altitude_m").as_double();
@@ -131,6 +144,8 @@ public:
     takeoff_tolerance_m_ = get_parameter("takeoff_tolerance_m").as_double();
     hover_settle_sec_ = get_parameter("hover_settle_sec").as_double();
     hover_velocity_tolerance_mps_ = get_parameter("hover_velocity_tolerance_mps").as_double();
+    tracking_handoff_sec_ = get_parameter("tracking_handoff_sec").as_double();
+    max_yaw_rate_radps_ = get_parameter("max_yaw_rate_radps").as_double();
     const auto kp = get_parameter("kp").as_double_array();
     const auto kv = get_parameter("kv").as_double_array();
     const auto rotation = get_parameter("transform_rotation_row_major").as_double_array();
@@ -144,15 +159,21 @@ public:
         min_thrust_ >= max_thrust_ || !std::isfinite(max_tilt_rad_) || max_tilt_rad_ <= 0.0 ||
         max_tilt_rad_ >= M_PI_2 || !std::isfinite(max_acceleration_) || max_acceleration_ <= 0.0 ||
         !std::isfinite(local_position_timeout_sec_) || local_position_timeout_sec_ <= 0.0 ||
+        !std::isfinite(max_ekf_reset_delta_m_) || max_ekf_reset_delta_m_ <= 0.0 ||
+        !std::isfinite(max_ekf_reset_heading_rad_) || max_ekf_reset_heading_rad_ <= 0.0 ||
         !std::isfinite(max_local_position_m_) || max_local_position_m_ <= 0.0 ||
         !std::isfinite(max_local_velocity_mps_) || max_local_velocity_mps_ <= 0.0 ||
+        !std::isfinite(frame_alignment_velocity_tolerance_mps_) ||
+        frame_alignment_velocity_tolerance_mps_ <= 0.0 ||
         !std::isfinite(auto_takeoff_altitude_m_) || auto_takeoff_altitude_m_ < 0.0 ||
         !std::isfinite(minimum_takeoff_altitude_m_) || minimum_takeoff_altitude_m_ < 0.0 ||
         minimum_takeoff_altitude_m_ > auto_takeoff_altitude_m_ ||
         !std::isfinite(takeoff_duration_sec_) || takeoff_duration_sec_ <= 0.0 ||
         !std::isfinite(takeoff_tolerance_m_) || takeoff_tolerance_m_ <= 0.0 ||
         !std::isfinite(hover_settle_sec_) || hover_settle_sec_ <= 0.0 ||
-        !std::isfinite(hover_velocity_tolerance_mps_) || hover_velocity_tolerance_mps_ <= 0.0)
+        !std::isfinite(hover_velocity_tolerance_mps_) || hover_velocity_tolerance_mps_ <= 0.0 ||
+        !std::isfinite(tracking_handoff_sec_) || tracking_handoff_sec_ < 0.0 ||
+        !std::isfinite(max_yaw_rate_radps_) || max_yaw_rate_radps_ <= 0.0)
     {
       throw std::runtime_error("invalid px4ctrl parameters");
     }
@@ -229,8 +250,10 @@ private:
     candidate.velocity = {msg->velocity.x, msg->velocity.y, msg->velocity.z};
     candidate.acceleration = {msg->acceleration.x, msg->acceleration.y, msg->acceleration.z};
     candidate.yaw = msg->yaw;
+    candidate.yaw_rate = msg->yaw_dot;
     if (!finite(candidate.position) || !finite(candidate.velocity) ||
-        !finite(candidate.acceleration) || !std::isfinite(candidate.yaw)) return;
+        !finite(candidate.acceleration) || !std::isfinite(candidate.yaw) ||
+        !std::isfinite(candidate.yaw_rate)) return;
     desired_ = candidate;
     pending_desired_ = candidate;
     desired_command_time_ = std::chrono::steady_clock::now();
@@ -279,6 +302,33 @@ private:
   void local_position_callback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg)
   {
     if (!msg) return;
+    const bool local_frame_reset = local_position_ &&
+      (msg->xy_reset_counter != local_position_->xy_reset_counter ||
+      msg->z_reset_counter != local_position_->z_reset_counter ||
+      msg->heading_reset_counter != local_position_->heading_reset_counter);
+    if (local_frame_reset && frame_aligned_) {
+      const Vector3 reset_delta(
+        static_cast<double>(msg->delta_xy[0]), static_cast<double>(msg->delta_xy[1]),
+        static_cast<double>(msg->delta_z));
+      const double heading_delta = static_cast<double>(msg->delta_heading);
+      if (!finite(reset_delta) || !std::isfinite(heading_delta) ||
+        reset_delta.norm() > max_ekf_reset_delta_m_ ||
+        std::abs(heading_delta) > max_ekf_reset_heading_rad_)
+      {
+        latch_safety_fault("px4_local_position_reset_too_large");
+      } else if (frame_aligned_) {
+        // PX4 position-control tasks compensate EKF resets by adding delta_xy
+        // and delta_z to their existing setpoints. Apply the same correction to
+        // every local-NED target used by this direct attitude controller.
+        translation_ += reset_delta;
+        hover_position_ += reset_delta;
+        takeoff_target_ += reset_delta;
+        tracking_handoff_position_ += reset_delta;
+        RCLCPP_WARN(get_logger(),
+          "Compensating PX4 local-position reset: delta [%.3f %.3f %.3f] m",
+          reset_delta.x(), reset_delta.y(), reset_delta.z());
+      }
+    }
     local_position_ = *msg;
     if (msg->timestamp > 0) px4_timestamp_ = msg->timestamp;
     local_position_time_ = std::chrono::steady_clock::now();
@@ -328,19 +378,70 @@ private:
       command_timeout_sec_;
   }
 
+  bool align_frames_if_stationary()
+  {
+    if (frame_aligned_) return true;
+    if (!align_to_px4_local_origin_) {
+      frame_aligned_ = true;
+      return true;
+    }
+    if (!odom_position_ || !odom_velocity_ || !local_position_ || !local_position_healthy()) {
+      return false;
+    }
+    const Vector3 local_velocity(
+      static_cast<double>(local_position_->vx), static_cast<double>(local_position_->vy),
+      static_cast<double>(local_position_->vz));
+    if (odom_velocity_->norm() > frame_alignment_velocity_tolerance_mps_ ||
+      local_velocity.norm() > frame_alignment_velocity_tolerance_mps_)
+    {
+      return false;
+    }
+    const Vector3 local_position(
+      static_cast<double>(local_position_->x), static_cast<double>(local_position_->y),
+      static_cast<double>(local_position_->z));
+    translation_ = local_position - rotation_ * *odom_position_;
+    frame_aligned_ = true;
+    RCLCPP_INFO(get_logger(), "Aligned planner frame to PX4 local NED: translation [%.3f %.3f %.3f] m",
+      translation_.x(), translation_.y(), translation_.z());
+    publish_status("planner_frame_aligned");
+    return true;
+  }
+
   ControlOutput calculate_output() const
   {
     const auto & lpos = *local_position_;
     const Vector3 p(static_cast<double>(lpos.x), static_cast<double>(lpos.y), static_cast<double>(lpos.z));
     const Vector3 v(static_cast<double>(lpos.vx), static_cast<double>(lpos.vy), static_cast<double>(lpos.vz));
     DesiredState d = desired_.value_or(DesiredState{});
-    d.position = rotation_ * d.position;
+    d.position = rotation_ * d.position + translation_;
     d.velocity = rotation_ * d.velocity;
     d.acceleration = rotation_ * d.acceleration;
+    const Vector3 heading_in_ned = rotation_ * Vector3(std::cos(d.yaw), std::sin(d.yaw), 0.0);
+    const Vector3 heading_rate_in_ned = rotation_ * Vector3(
+      -std::sin(d.yaw) * d.yaw_rate, std::cos(d.yaw) * d.yaw_rate, 0.0);
+    d.yaw = std::atan2(heading_in_ned.y(), heading_in_ned.x());
+    const double heading_norm_sq = heading_in_ned.head<2>().squaredNorm();
+    d.yaw_rate = heading_norm_sq > 1e-8 ?
+      (heading_in_ned.x() * heading_rate_in_ned.y() -
+      heading_in_ned.y() * heading_rate_in_ned.x()) / heading_norm_sq : 0.0;
     if (!command_fresh()) {
       d.position = p;
       d.velocity.setZero();
       d.acceleration.setZero();
+      d.yaw_rate = 0.0;
+    } else if (state_ == ControlState::tracking && tracking_handoff_start_time_ &&
+      tracking_handoff_sec_ > 1e-6)
+    {
+      const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - *tracking_handoff_start_time_).count();
+      const double u = std::clamp(elapsed / tracking_handoff_sec_, 0.0, 1.0);
+      const double blend = u * u * (3.0 - 2.0 * u);
+      d.position = (1.0 - blend) * tracking_handoff_position_ + blend * d.position;
+      d.velocity = (1.0 - blend) * tracking_handoff_velocity_ + blend * d.velocity;
+      d.acceleration *= blend;
+      d.yaw = tracking_handoff_yaw_ + blend * std::remainder(
+        d.yaw - tracking_handoff_yaw_, 2.0 * M_PI);
+      d.yaw_rate *= blend;
     }
     Vector3 a = d.acceleration + kp_.cwiseProduct(d.position - p) + kv_.cwiseProduct(d.velocity - v);
     if (!a.allFinite()) a.setZero();
@@ -357,8 +458,9 @@ private:
       force.y() = horizontal.y() * max_horizontal / horizontal.norm();
     }
 
-    Vector3 heading = rotation_ * Vector3(std::cos(manual_yaw_.value_or(d.yaw)),
-                                          std::sin(manual_yaw_.value_or(d.yaw)), 0.0);
+    Vector3 heading = manual_yaw_ ? rotation_ * Vector3(
+      std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0) :
+      Vector3(std::cos(d.yaw), std::sin(d.yaw), 0.0);
     heading.z() = 0.0;
     if (heading.norm() < 1e-6) heading = Vector3(1.0, 0.0, 0.0);
     heading.normalize();
@@ -375,6 +477,8 @@ private:
     ControlOutput out;
     out.attitude = Eigen::Quaterniond(rotation).normalized();
     out.thrust = std::clamp(force.norm() / gravity_ * hover_thrust_, min_thrust_, max_thrust_);
+    out.yaw_rate = std::clamp(manual_yaw_ ? 0.0 : d.yaw_rate,
+      -max_yaw_rate_radps_, max_yaw_rate_radps_);
     return out;
   }
 
@@ -428,6 +532,10 @@ private:
       if (command_fresh() && pending_desired_ && settled_for >= hover_settle_sec_) {
         state_ = ControlState::tracking;
         desired_ = pending_desired_;
+        tracking_handoff_position_ = current;
+        tracking_handoff_velocity_ = velocity;
+        tracking_handoff_yaw_ = std::isfinite(p.heading) ? static_cast<double>(p.heading) : hold_yaw_;
+        tracking_handoff_start_time_ = std::chrono::steady_clock::now();
         publish_status("state_tracking");
       }
     }
@@ -450,7 +558,13 @@ private:
       return;
     }
     if (!state_fresh()) {
-      publish_status("waiting_for_fresh_fastlio_odom");
+      if (vehicle_status_ && vehicle_status_->arming_state !=
+        px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
+      {
+        latch_safety_fault("fastlio_odom_timeout");
+      } else {
+        publish_status("waiting_for_fresh_fastlio_odom");
+      }
       return;
     }
     if (!local_position_healthy()) {
@@ -459,6 +573,11 @@ private:
         px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED) {
         latch_safety_fault("px4_local_position_unhealthy");
       }
+      return;
+    }
+
+    if (!align_frames_if_stationary()) {
+      publish_status("waiting_for_stationary_frame_alignment");
       return;
     }
 
@@ -471,7 +590,7 @@ private:
       DesiredState hold;
       const Vector3 target = state_ == ControlState::takeoff ? takeoff_target_ : hover_position_;
       // calculate_output applies planner->PX4 rotation to all desired states.
-      hold.position = rotation_.transpose() * target;
+      hold.position = rotation_.transpose() * (target - translation_);
       hold.velocity.setZero();
       hold.acceleration.setZero();
       const Vector3 px4_heading{std::cos(hold_yaw_), std::sin(hold_yaw_), 0.0};
@@ -488,7 +607,7 @@ private:
     setpoint.q_d = {static_cast<float>(output.attitude.w()), static_cast<float>(output.attitude.x()),
                     static_cast<float>(output.attitude.y()), static_cast<float>(output.attitude.z())};
     setpoint.thrust_body = {0.0F, 0.0F, static_cast<float>(-output.thrust)};
-    setpoint.yaw_sp_move_rate = NAN;
+    setpoint.yaw_sp_move_rate = static_cast<float>(output.yaw_rate);
     setpoint_pub_->publish(setpoint);
     if (!command_seen_ || !start_offboard_ || !vehicle_status_) return;
     const double elapsed = std::chrono::duration<double>(
@@ -553,9 +672,13 @@ private:
   double max_tilt_rad_{0.52};
   double max_acceleration_{4.0};
   double local_position_timeout_sec_{0.5};
+  double max_ekf_reset_delta_m_{1.0};
+  double max_ekf_reset_heading_rad_{0.35};
   bool require_local_position_valid_{true};
   double max_local_position_m_{100.0};
   double max_local_velocity_mps_{15.0};
+  bool align_to_px4_local_origin_{true};
+  double frame_alignment_velocity_tolerance_mps_{0.20};
   bool land_on_safety_fault_{true};
   double auto_takeoff_altitude_m_{0.5};
   double minimum_takeoff_altitude_m_{0.25};
@@ -563,9 +686,13 @@ private:
   double takeoff_tolerance_m_{0.08};
   double hover_settle_sec_{0.8};
   double hover_velocity_tolerance_mps_{0.15};
+  double tracking_handoff_sec_{0.75};
+  double max_yaw_rate_radps_{1.5};
   Vector3 kp_{1.5, 1.5, 1.8};
   Vector3 kv_{1.2, 1.2, 1.4};
   Matrix3 rotation_{Matrix3::Identity()};
+  Vector3 translation_{Vector3::Zero()};
+  bool frame_aligned_{false};
   std::optional<Vector3> odom_position_;
   std::optional<Vector3> odom_velocity_;
   std::optional<Eigen::Quaterniond> odom_orientation_;
@@ -589,6 +716,10 @@ private:
   double hold_yaw_{0.0};
   std::optional<std::chrono::steady_clock::time_point> takeoff_start_time_;
   std::optional<std::chrono::steady_clock::time_point> hover_settle_start_time_;
+  Vector3 tracking_handoff_position_{Vector3::Zero()};
+  Vector3 tracking_handoff_velocity_{Vector3::Zero()};
+  double tracking_handoff_yaw_{0.0};
+  std::optional<std::chrono::steady_clock::time_point> tracking_handoff_start_time_;
   uint64_t px4_timestamp_{0};
   rclcpp::Subscription<PositionCommand>::SharedPtr command_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,6 +52,7 @@ public:
     declare_parameter("max_position_step_slack_m", 0.35);
     declare_parameter("max_position_velocity_residual_m", 0.25);
     declare_parameter("max_sample_interval_sec", 0.75);
+    declare_parameter("max_sample_age_sec", 0.75);
     declare_parameter("max_attitude_step_rad", 1.3);
     declare_parameter("transform_translation", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter("world_rotation_row_major", std::vector<double>{
@@ -78,6 +80,7 @@ public:
     max_position_velocity_residual_m_ =
       get_parameter("max_position_velocity_residual_m").as_double();
     max_sample_interval_sec_ = get_parameter("max_sample_interval_sec").as_double();
+    max_sample_age_sec_ = get_parameter("max_sample_age_sec").as_double();
     max_attitude_step_rad_ = get_parameter("max_attitude_step_rad").as_double();
     align_to_px4_local_origin_ = get_parameter("align_to_px4_local_origin").as_bool();
     translation_ = vector3_parameter("transform_translation");
@@ -93,6 +96,7 @@ public:
       !std::isfinite(max_position_velocity_residual_m_) ||
       max_position_velocity_residual_m_ < 0.0 ||
       !std::isfinite(max_sample_interval_sec_) || max_sample_interval_sec_ <= 0.0 ||
+      !std::isfinite(max_sample_age_sec_) || max_sample_age_sec_ <= 0.0 ||
       !std::isfinite(max_attitude_step_rad_) || max_attitude_step_rad_ <= 0.0 ||
       max_attitude_step_rad_ > 3.141592653589793)
     {
@@ -124,6 +128,34 @@ public:
   }
 
 private:
+  void update_clock_mapping(int64_t ros_now_ns, uint64_t px4_timestamp_us)
+  {
+    const double ros_now_us = static_cast<double>(ros_now_ns) / 1000.0;
+    if (last_sync_ros_us_ && last_sync_px4_timestamp_us_) {
+      const double delta_ros_us = ros_now_us - *last_sync_ros_us_;
+      const double delta_px4_us = static_cast<double>(px4_timestamp_us) -
+        static_cast<double>(*last_sync_px4_timestamp_us_);
+      if (delta_ros_us >= 1000000.0 && delta_px4_us > 0.0) {
+        const double observed_rate = delta_px4_us / delta_ros_us;
+        if (std::isfinite(observed_rate) && observed_rate >= 0.1 && observed_rate <= 10.0) {
+          px4_ros_clock_rate_ = 0.85 * px4_ros_clock_rate_ + 0.15 * observed_rate;
+        }
+        last_sync_ros_us_ = ros_now_us;
+        last_sync_px4_timestamp_us_ = px4_timestamp_us;
+      }
+    } else {
+      last_sync_ros_us_ = ros_now_us;
+      last_sync_px4_timestamp_us_ = px4_timestamp_us;
+    }
+
+    timestamp_offset_us_ = static_cast<double>(px4_timestamp_us) - px4_ros_clock_rate_ * ros_now_us;
+    if (!clock_mapping_logged_) {
+      RCLCPP_INFO(get_logger(), "Started FAST-LIO to PX4 clock mapping: rate %.7f, offset %.3f ms",
+        px4_ros_clock_rate_, *timestamp_offset_us_ / 1000.0);
+      clock_mapping_logged_ = true;
+    }
+  }
+
   Vector3 vector3_parameter(const std::string & name)
   {
     const auto values = get_parameter(name).as_double_array();
@@ -228,6 +260,24 @@ private:
       latch_fault("odometry timestamp is zero or negative");
       return;
     }
+    const int64_t ros_now_ns = get_clock()->now().nanoseconds();
+    if (ros_now_ns <= 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Waiting for ROS simulation clock before timestamping external odometry");
+      return;
+    }
+    const double sample_age_sec = static_cast<double>(ros_now_ns - stamp_ns) / 1e9;
+    if (sample_age_sec > max_sample_age_sec_) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Skipping stale FAST-LIO sample: age %.3f s exceeds %.3f s",
+        sample_age_sec, max_sample_age_sec_);
+      return;
+    }
+    if (sample_age_sec < -0.05) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Skipping FAST-LIO sample %.3f s ahead of ROS simulation clock", -sample_age_sec);
+      return;
+    }
     const double speed = velocity_ned.norm();
     if (!std::isfinite(speed) || speed > max_linear_speed_mps_) {
       latch_fault("odometry velocity exceeded max_linear_speed_mps");
@@ -274,19 +324,21 @@ private:
     }
 
     px4_msgs::msg::VehicleOdometry out;
-    // PX4 uses a boot-time microsecond clock while FAST-LIO uses the ROS clock.
-    // Estimate the constant clock offset once, then preserve the sensor sample
-    // time in timestamp_sample. Using the latest PX4 timestamp for both fields
-    // hides transport delay and makes EKF2 external-vision delay impossible to
-    // tune reliably.
+    // FAST-LIO stamps use ROS simulation time and PX4 uses its own clock.
+    // Continuously estimate their rate and offset so clock drift does not make
+    // recent sensor samples appear seconds old to EKF2.
+    update_clock_mapping(ros_now_ns, px4_timestamp_us_);
     const uint64_t input_stamp_us = static_cast<uint64_t>(stamp_ns / 1000LL);
-    if (!timestamp_offset_us_) {
-      timestamp_offset_us_ = static_cast<int64_t>(px4_timestamp_us_) -
-        static_cast<int64_t>(input_stamp_us);
-      RCLCPP_INFO(get_logger(), "Mapped FAST-LIO clock to PX4 clock: offset %.3f ms",
-        static_cast<double>(*timestamp_offset_us_) / 1000.0);
+    const double mapped_sample_double = px4_ros_clock_rate_ * static_cast<double>(input_stamp_us) +
+      *timestamp_offset_us_;
+    if (!std::isfinite(mapped_sample_double) ||
+      mapped_sample_double > static_cast<double>(std::numeric_limits<int64_t>::max()) ||
+      mapped_sample_double < static_cast<double>(std::numeric_limits<int64_t>::min()))
+    {
+      latch_fault("mapped odometry timestamp is outside representable range");
+      return;
     }
-    const int64_t mapped_sample = static_cast<int64_t>(input_stamp_us) + *timestamp_offset_us_;
+    const int64_t mapped_sample = static_cast<int64_t>(std::llround(mapped_sample_double));
     if (mapped_sample <= 0) {
       latch_fault("mapped odometry timestamp is zero or negative");
       return;
@@ -359,6 +411,7 @@ private:
   double max_position_step_slack_m_{0.35};
   double max_position_velocity_residual_m_{0.25};
   double max_sample_interval_sec_{0.75};
+  double max_sample_age_sec_{0.75};
   double max_attitude_step_rad_{1.3};
   Vector3 translation_{};
   Matrix3 world_rotation_{Matrix3::Identity()};
@@ -378,7 +431,11 @@ private:
   rclcpp::Publisher<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr emergency_pub_;
   uint64_t px4_timestamp_us_{0};
-  std::optional<int64_t> timestamp_offset_us_;
+  double px4_ros_clock_rate_{1.0};
+  std::optional<double> timestamp_offset_us_;
+  std::optional<double> last_sync_ros_us_;
+  std::optional<uint64_t> last_sync_px4_timestamp_us_;
+  bool clock_mapping_logged_{false};
 };
 
 int main(int argc, char ** argv)

@@ -83,3 +83,29 @@
 本轮完成了“EGO 位置/速度/加速度命令 -> PX4Ctrl 几何姿态与推力 -> PX4 Offboard”的闭环 SITL 跟踪，目标终点误差约 4 cm。此前不能进入跟踪状态的起飞门控问题已修复，且本次数据证明控制器已经进入并完成目标跟踪。
 
 这不是避障验收：没有加入新障碍物，也没有验证 EGO 重规划后的连续轨迹交接。PX4Ctrl 直接输出姿态/推力并绕过 PX4 位置环，安全余度和实机性能仍需在 SITL 做多方向、多速度、扰动和障碍测试，并以 PX4 ULog 分析姿态响应、推力饱和及估计器创新后，才能考虑受控实机验证。
+
+## 2026-11-03 坐标对齐回归复测
+
+本次代码复核发现原控制器把 planner `lidar` 位置仅做旋转，而 EV 桥接器会额外将 FAST-LIO 原点平移对齐到 PX4 local NED。现已在控制器启动时以静止状态计算并应用同一类平移；PX4 local position reset 在已解锁时触发锁存故障，未解锁时重新对齐。另修复 FAST-LIO 超时后控制器仍持续刷新 Offboard 模式、却不再发送姿态设定点的失效路径：已解锁时现请求 PX4 降落。
+
+验证状态：`colcon build --packages-up-to px4ctrl` 和修改后的 `colcon build --packages-select px4ctrl --symlink-install` 均通过。首次回归误用了 PX4 launch 目录里的旧副本，该副本没有设置 `EKF2_DELAY_MAX=800`；失败数据保存在 `test_results/2026-11-03_frame_alignment_validation.csv`。第二次使用 `mid360_ws` 最新 launch，PX4 日志确认 `EKF2_EV_CTRL=7`、`EKF2_DELAY_MAX=800`、`EKF2_HGT_REF=3`。EV 位置/速度创新未被拒绝，但 ULog 中 EV 数据在 PX4 仿真时间约 54.7 s 后停止；约 55.1 s 后 `cs_ev_pos/vel/hgt` 变为 false，local position 进入 dead-reckoning，控制器状态停在 `waiting_for_healthy_px4_local_position`，未解锁且未执行目标。该数据保存在 `test_results/2026-11-03_frame_alignment_success.csv`，文件名仅表示使用新 launch 的复测轮次，不代表飞行通过。
+
+因此，本次源码改动已构建，但其飞行闭环回归尚未通过。下一步应先追踪 EV 发布为何在仿真 55 s 左右停止（检查 FAST-LIO/PGO 输出与桥接器锁存日志），再重新验证坐标偏移非零时的目标跟踪。两轮 PGO 正常退出时执行了其配置的地图自动保存；请留意 `fastlio2_pgo_ws` 的地图文件是否需要恢复到测试前版本。
+
+## 2026-11-03 控制交接与时钟映射更新
+
+- EGO 到 PX4 的 `hover -> tracking` 交接增加 0.75 s smoothstep 参考混合，避免起飞期间 EGO 轨迹已经前进、控制器解锁跟踪时参考位置突然跳变。
+- 控制器现在将 `PositionCommand.yaw_dot` 按 planner-to-NED 旋转映射后，作为限幅后的 PX4 姿态 yaw-rate feedforward；最大值默认 1.5 rad/s。
+- FAST-LIO bridge 不再假设 ROS 仿真时间与 PX4 时间的偏移恒定。它根据持续到达的 PX4 local-position 时间与 ROS `/clock` 估计时钟速率和偏移，并按 `max_sample_age_sec: 0.75` 丢弃陈旧 odometry。这里保留原始采样年龄供 EKF2 使用，没有把旧样本改写成当前样本。
+- 本轮同步观察到 FAST-LIO 样本年龄约 40-110 ms，PX4 收到的 `timestamp_sample` 滞后约 50-120 ms；重启前固定偏移映射出现约 18 s 偏差。更新后 PX4 local position 在采样窗口内为 valid 且未 dead-reckoning。
+- `fastlio2_px4_odom_bridge` 与 `px4ctrl` 目标包构建通过。全依赖构建另外尝试一次，但在未修改的 `px4_msgs` ament Python symlink 步骤因 build 目录已有同名目录失败；目标包构建不受影响。
+- 本轮没有发送目标或解锁。PX4 `pre_flight_checks_pass` 保持 false，因此不能把本轮记为新的飞行回归通过。PX4 源码的 `mc_att_control_main.cpp` 也确认姿态输入只接受严格递增的 timestamp；控制器继续使用最新 PX4 输出时间戳。官方 Offboard 机制说明见 [PX4 Offboard 文档](https://docs.px4.io/main/en/flight_modes/offboard.html)。
+
+## 2026-11-03 动态轨迹回归
+
+一轮 0.5 m 目标保持测试中，PX4 保持 armed/Offboard 30 s，EGO 命令持续有效，末端三维误差约 5.2 cm。随后发送相邻 1 m 目标验证运动段时，PX4 的 `xy/z_reset_counter` 在起飞/估计器初始化过程中变化，旧控制器把任意计数器变化当作故障并停止姿态设定点，PX4 随后进入 `AUTO_LAND`。该行为不是目标跟踪误差，而是 reset 处理过于严格。
+
+现已按 PX4 `mc_pos_control` 的处理方式修改：使用 `delta_xy`/`delta_z` 同步补偿控制器保存的 NED 目标；仅当 reset 位移超过 `max_ekf_reset_delta_m` 或偏航重置超过 `max_ekf_reset_heading_rad` 时才锁存安全故障。修改后需重新启动完整 SITL，再重复动态轨迹测试。
+
+重新启动全新 PX4/Gazebo、FAST-LIO 和 PX4Ctrl 后，动态回归成功。测试文件为
+`test_results/2026-11-03_ego_attitude_fresh_1m_motion.csv`：记录 30 s、221 个样本；其中 180 个样本处于 armed + Offboard，全部样本 `xy_valid=true` 且 `dead_reckoning=false`。EGO 轨迹从起飞点平滑推进到约 `(1.0, 0.0, 0.5)` m，末端 PX4 NED 位置约 `(0.006, 0.951, -0.506)` m，对应 lidar 位置误差 **4.4 cm**。全段 RMS 包含起飞阶段为约 0.493 m，最大误差约 0.926 m；稳定跟踪末端误差约 4-5 cm。测试结束后已停止 PX4、Gazebo、FAST-LIO 和 PX4Ctrl 进程。
