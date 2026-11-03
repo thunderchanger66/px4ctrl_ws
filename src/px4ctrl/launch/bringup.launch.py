@@ -72,8 +72,6 @@ def generate_launch_description():
             cmd=["MicroXRCEAgent", "udp4", "-p", agent_port],
             name="micro_xrce_agent",
             output="screen",
-            respawn=True,
-            respawn_delay=2.0,
             condition=IfCondition(start_agent),
         ),
         ego_launch,

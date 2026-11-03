@@ -17,6 +17,10 @@ fastlio2_px4_odom_bridge:
     max_vertical_position_m: 8.0
     max_position_step_slack_m: 0.35
     max_position_velocity_residual_m: 0.25
+    # PGO loop closure can move the absolute pose by a bounded amount. Such a
+    # correction is sent to PX4 as a VehicleOdometry reset instead of an
+    # emergency stop. Larger jumps remain a hard safety fault.
+    max_pose_reset_jump_m: 1.50
     max_sample_interval_sec: 0.75
     max_sample_age_sec: 0.75
     max_attitude_step_rad: 1.3

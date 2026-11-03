@@ -107,6 +107,10 @@ namespace ego_planner
         bool callEmergencyStop(Eigen::Vector3d stop_pos); // front-end and back-end method
         bool planFromGlobalTraj(int trial_times = 1);
         bool planFromCurrentTraj(int trial_times = 1);
+        // Publish a collision-free hold at the current estimate when a new
+        // trajectory cannot be validated. This keeps PX4Ctrl in a controlled
+        // hover and waits for a fresh goal instead of executing stale points.
+        void publishHoldTrajectory();
 
         /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
         void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);

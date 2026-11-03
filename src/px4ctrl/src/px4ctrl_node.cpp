@@ -46,7 +46,50 @@ struct ControlOutput
   Eigen::Quaterniond attitude{Eigen::Quaterniond::Identity()};
   double thrust{0.5};
   double yaw_rate{0.0};
+  bool saturated{false};
 };
+
+// PX4's ControlMath::thrustToAttitude() uses a body-z axis in NED and a
+// negative collective thrust. Keep the same convention here so the external
+// attitude setpoint has exactly the same geometry as PX4's own position loop.
+Vector3 limit_body_z_tilt(Vector3 body_z, double max_tilt_rad)
+{
+  constexpr double kEpsilon = 1e-12;
+  const Vector3 world_z(0.0, 0.0, 1.0);
+  const double norm = body_z.norm();
+  if (!std::isfinite(norm) || norm < kEpsilon) return world_z;
+  body_z /= norm;
+  const double dot = std::clamp(body_z.dot(world_z), -1.0, 1.0);
+  const double angle = std::min(std::acos(dot), max_tilt_rad);
+  Vector3 rejection = body_z - dot * world_z;
+  const double rejection_norm = rejection.norm();
+  if (rejection_norm < kEpsilon) {
+    rejection = Vector3(1.0, 0.0, 0.0);
+  } else {
+    rejection /= rejection_norm;
+  }
+  return std::cos(angle) * world_z + std::sin(angle) * rejection;
+}
+
+Eigen::Quaterniond body_z_and_yaw_to_attitude(const Vector3 & body_z, double yaw)
+{
+  const Vector3 y_c(-std::sin(yaw), std::cos(yaw), 0.0);
+  Vector3 body_x = y_c.cross(body_z);
+  if (body_z.z() < 0.0) body_x = -body_x;
+  if (body_x.squaredNorm() < 1e-12) {
+    body_x = Vector3(0.0, 0.0, 1.0);
+  } else {
+    body_x.normalize();
+  }
+  Vector3 body_y = body_z.cross(body_x);
+  if (body_y.squaredNorm() < 1e-12) body_y = Vector3(0.0, 1.0, 0.0);
+  else body_y.normalize();
+  Matrix3 rotation;
+  rotation.col(0) = body_x;
+  rotation.col(1) = body_y;
+  rotation.col(2) = body_z;
+  return Eigen::Quaterniond(rotation).normalized();
+}
 
 enum class ControlState
 {
@@ -106,14 +149,21 @@ public:
     declare_parameter("land_on_safety_fault", true);
     declare_parameter("auto_takeoff_altitude_m", 0.50);
     declare_parameter("minimum_takeoff_altitude_m", 0.25);
+    declare_parameter("minimum_tracking_altitude_m", 0.25);
     declare_parameter("takeoff_duration_sec", 3.0);
     declare_parameter("takeoff_tolerance_m", 0.08);
     declare_parameter("hover_settle_sec", 0.80);
     declare_parameter("hover_velocity_tolerance_mps", 0.15);
     declare_parameter("tracking_handoff_sec", 0.75);
+    declare_parameter("command_blend_sec", 0.25);
+    declare_parameter("max_command_position_jump_m", 1.0);
+    declare_parameter("max_command_velocity_jump_mps", 1.5);
     declare_parameter("max_yaw_rate_radps", 1.5);
     declare_parameter("kp", std::vector<double>{1.5, 1.5, 1.8});
     declare_parameter("kv", std::vector<double>{1.2, 1.2, 1.4});
+    declare_parameter("ki", std::vector<double>{0.10, 0.10, 0.15});
+    declare_parameter("integral_limit_mps2", std::vector<double>{0.40, 0.40, 0.50});
+    declare_parameter("integral_enable_velocity_error_mps", 0.60);
     declare_parameter("transform_rotation_row_major", std::vector<double>{
       0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0});
 
@@ -142,16 +192,25 @@ public:
     land_on_safety_fault_ = get_parameter("land_on_safety_fault").as_bool();
     auto_takeoff_altitude_m_ = get_parameter("auto_takeoff_altitude_m").as_double();
     minimum_takeoff_altitude_m_ = get_parameter("minimum_takeoff_altitude_m").as_double();
+    minimum_tracking_altitude_m_ = get_parameter("minimum_tracking_altitude_m").as_double();
     takeoff_duration_sec_ = get_parameter("takeoff_duration_sec").as_double();
     takeoff_tolerance_m_ = get_parameter("takeoff_tolerance_m").as_double();
     hover_settle_sec_ = get_parameter("hover_settle_sec").as_double();
     hover_velocity_tolerance_mps_ = get_parameter("hover_velocity_tolerance_mps").as_double();
     tracking_handoff_sec_ = get_parameter("tracking_handoff_sec").as_double();
+    command_blend_sec_ = get_parameter("command_blend_sec").as_double();
+    max_command_position_jump_m_ = get_parameter("max_command_position_jump_m").as_double();
+    max_command_velocity_jump_mps_ = get_parameter("max_command_velocity_jump_mps").as_double();
     max_yaw_rate_radps_ = get_parameter("max_yaw_rate_radps").as_double();
     const auto kp = get_parameter("kp").as_double_array();
     const auto kv = get_parameter("kv").as_double_array();
+    const auto ki = get_parameter("ki").as_double_array();
+    const auto integral_limit = get_parameter("integral_limit_mps2").as_double_array();
+    integral_enable_velocity_error_mps_ =
+      get_parameter("integral_enable_velocity_error_mps").as_double();
     const auto rotation = get_parameter("transform_rotation_row_major").as_double_array();
-    if (kp.size() != 3 || kv.size() != 3 || rotation.size() != 9 ||
+    if (kp.size() != 3 || kv.size() != 3 || ki.size() != 3 || integral_limit.size() != 3 ||
+        rotation.size() != 9 ||
         !std::isfinite(state_timeout_sec_) || state_timeout_sec_ <= 0.0 ||
         !std::isfinite(command_timeout_sec_) || command_timeout_sec_ <= 0.0 ||
         !std::isfinite(prestream_seconds_) || prestream_seconds_ < 0.0 ||
@@ -171,11 +230,16 @@ public:
         !std::isfinite(auto_takeoff_altitude_m_) || auto_takeoff_altitude_m_ < 0.0 ||
         !std::isfinite(minimum_takeoff_altitude_m_) || minimum_takeoff_altitude_m_ < 0.0 ||
         minimum_takeoff_altitude_m_ > auto_takeoff_altitude_m_ ||
+        !std::isfinite(minimum_tracking_altitude_m_) || minimum_tracking_altitude_m_ < 0.0 ||
         !std::isfinite(takeoff_duration_sec_) || takeoff_duration_sec_ <= 0.0 ||
         !std::isfinite(takeoff_tolerance_m_) || takeoff_tolerance_m_ <= 0.0 ||
         !std::isfinite(hover_settle_sec_) || hover_settle_sec_ <= 0.0 ||
         !std::isfinite(hover_velocity_tolerance_mps_) || hover_velocity_tolerance_mps_ <= 0.0 ||
         !std::isfinite(tracking_handoff_sec_) || tracking_handoff_sec_ < 0.0 ||
+        !std::isfinite(command_blend_sec_) || command_blend_sec_ < 0.0 ||
+        !std::isfinite(max_command_position_jump_m_) || max_command_position_jump_m_ <= 0.0 ||
+        !std::isfinite(max_command_velocity_jump_mps_) || max_command_velocity_jump_mps_ <= 0.0 ||
+        !std::isfinite(integral_enable_velocity_error_mps_) || integral_enable_velocity_error_mps_ <= 0.0 ||
         !std::isfinite(max_yaw_rate_radps_) || max_yaw_rate_radps_ <= 0.0)
     {
       throw std::runtime_error("invalid px4ctrl parameters");
@@ -183,8 +247,12 @@ public:
     for (size_t i = 0; i < 3; ++i) {
       kp_(static_cast<Eigen::Index>(i)) = kp[i];
       kv_(static_cast<Eigen::Index>(i)) = kv[i];
-      if (!std::isfinite(kp[i]) || !std::isfinite(kv[i]) || kp[i] < 0.0 || kv[i] < 0.0) {
-        throw std::runtime_error("kp and kv must be finite and non-negative");
+      ki_(static_cast<Eigen::Index>(i)) = ki[i];
+      integral_limit_(static_cast<Eigen::Index>(i)) = integral_limit[i];
+      if (!std::isfinite(kp[i]) || !std::isfinite(kv[i]) || !std::isfinite(ki[i]) ||
+        !std::isfinite(integral_limit[i]) || kp[i] < 0.0 || kv[i] < 0.0 || ki[i] < 0.0 ||
+        integral_limit[i] <= 0.0) {
+        throw std::runtime_error("kp, kv, ki and integral limits must be finite and non-negative");
       }
     }
     for (size_t r = 0; r < 3; ++r) for (size_t c = 0; c < 3; ++c) {
@@ -257,7 +325,30 @@ private:
     if (!finite(candidate.position) || !finite(candidate.velocity) ||
         !finite(candidate.acceleration) || !std::isfinite(candidate.yaw) ||
         !std::isfinite(candidate.yaw_rate)) return;
+    const bool has_previous_target = reference_target_.has_value();
+    const DesiredState previous_target = reference_target_.value_or(candidate);
+    const double position_jump = has_previous_target ?
+      (candidate.position - previous_target.position).norm() : 0.0;
+    const double velocity_jump = has_previous_target ?
+      (candidate.velocity - previous_target.velocity).norm() : 0.0;
+
+    // EGO normally replaces a B-spline with a state-continuous command. If a
+    // planner reset or stale message violates that contract, transition from
+    // the currently applied reference instead of sending a step to the
+    // attitude controller. Normal trajectory samples remain unfiltered.
+    if (has_previous_target &&
+      (position_jump > max_command_position_jump_m_ ||
+       velocity_jump > max_command_velocity_jump_mps_))
+    {
+      reference_blend_from_ = desired_.value_or(previous_target);
+      reference_blend_start_ = std::chrono::steady_clock::now();
+      reference_blending_ = command_blend_sec_ > 1e-6;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Blending discontinuous EGO command: position jump %.2f m, velocity jump %.2f m/s",
+        position_jump, velocity_jump);
+    }
     desired_ = candidate;
+    reference_target_ = candidate;
     pending_desired_ = candidate;
     desired_command_time_ = std::chrono::steady_clock::now();
     command_seen_ = true;
@@ -299,7 +390,32 @@ private:
 
   void attitude_callback(const px4_msgs::msg::VehicleAttitude::SharedPtr msg)
   {
-    if (msg->timestamp > 0) px4_timestamp_ = msg->timestamp;
+    update_px4_clock(msg->timestamp);
+  }
+
+  void update_px4_clock(uint64_t timestamp)
+  {
+    if (timestamp > px4_timestamp_) {
+      px4_timestamp_ = timestamp;
+    }
+  }
+
+  uint64_t current_px4_timestamp() const
+  {
+    return px4_timestamp_;
+  }
+
+  uint64_t next_setpoint_timestamp()
+  {
+    uint64_t timestamp = current_px4_timestamp();
+    if (timestamp == 0) return 0;
+    // PX4 mc_att_control accepts only strictly increasing attitude setpoints.
+    // PX4 output timestamps can repeat between state messages, so advance by
+    // the smallest possible amount instead of projecting the setpoint clock
+    // into the future when the output stream is temporarily slower.
+    timestamp = std::max(timestamp, last_setpoint_timestamp_ + 1);
+    last_setpoint_timestamp_ = timestamp;
+    return timestamp;
   }
 
   void local_position_callback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg)
@@ -345,7 +461,7 @@ private:
       }
     }
     local_position_ = *msg;
-    if (msg->timestamp > 0) px4_timestamp_ = msg->timestamp;
+    update_px4_clock(msg->timestamp);
     local_position_time_ = std::chrono::steady_clock::now();
     local_position_received_ = true;
   }
@@ -381,6 +497,12 @@ private:
 
   bool state_fresh() const
   {
+    // PX4 local position is the state used by the feedback controller. FAST-
+    // LIO is needed before alignment, but after that it is an upstream input
+    // to the estimator/planner rather than a second control-state source.
+    if (frame_aligned_) return local_position_received_ && local_position_time_ &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - *local_position_time_).count() <=
+        local_position_timeout_sec_;
     return odom_position_ && odom_velocity_ && odom_time_ &&
       std::chrono::duration<double>(std::chrono::steady_clock::now() - *odom_time_).count() <=
       state_timeout_sec_;
@@ -422,15 +544,49 @@ private:
     return true;
   }
 
-  ControlOutput calculate_output() const
+  ControlOutput calculate_output()
   {
     const auto & lpos = *local_position_;
     const Vector3 p(static_cast<double>(lpos.x), static_cast<double>(lpos.y), static_cast<double>(lpos.z));
     const Vector3 v(static_cast<double>(lpos.vx), static_cast<double>(lpos.vy), static_cast<double>(lpos.vz));
     DesiredState d = desired_.value_or(DesiredState{});
+
+    // EGO publishes references in the planner frame.  Blend a discontinuous
+    // replan before applying the planner-to-NED transform; blending after the
+    // transform mixes a previous planner-frame state with a NED state and can
+    // create a false position/yaw step when axes are exchanged.
+    if (reference_blending_ && reference_blend_start_ && command_blend_sec_ > 1e-6) {
+      const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - *reference_blend_start_).count();
+      const double u = std::clamp(elapsed / command_blend_sec_, 0.0, 1.0);
+      const double blend = u * u * (3.0 - 2.0 * u);
+      const DesiredState & from = reference_blend_from_;
+      d.position = (1.0 - blend) * from.position + blend * d.position;
+      d.velocity = (1.0 - blend) * from.velocity + blend * d.velocity;
+      d.acceleration = (1.0 - blend) * from.acceleration + blend * d.acceleration;
+      d.yaw = from.yaw + blend * std::remainder(d.yaw - from.yaw, 2.0 * M_PI);
+      d.yaw_rate = (1.0 - blend) * from.yaw_rate + blend * d.yaw_rate;
+      if (u >= 1.0) reference_blending_ = false;
+    }
+
     d.position = rotation_ * d.position + translation_;
     d.velocity = rotation_ * d.velocity;
     d.acceleration = rotation_ * d.acceleration;
+    if (state_ == ControlState::tracking && frame_aligned_ && takeoff_origin_z_) {
+      // The planner frame can briefly publish a failed/recovery trajectory
+      // below the safe flight floor. Keep the direct attitude controller from
+      // commanding a descent while EGO is waiting for a valid replacement.
+      const double minimum_z = *takeoff_origin_z_ - minimum_tracking_altitude_m_;
+      if (d.position.z() > minimum_z) {
+        // In NED, smaller z means higher altitude. If already above the
+        // floor, hold the current altitude instead of descending to it.
+        d.position.z() = std::min(p.z(), minimum_z);
+        if (d.velocity.z() > 0.0) d.velocity.z() = 0.0;
+        if (d.acceleration.z() > 0.0) d.acceleration.z() = 0.0;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Clamping planner command to minimum tracking altitude %.2f m", minimum_tracking_altitude_m_);
+      }
+    }
     const Vector3 heading_in_ned = rotation_ * Vector3(std::cos(d.yaw), std::sin(d.yaw), 0.0);
     const Vector3 heading_rate_in_ned = rotation_ * Vector3(
       -std::sin(d.yaw) * d.yaw_rate, std::cos(d.yaw) * d.yaw_rate, 0.0);
@@ -459,42 +615,60 @@ private:
         d.yaw - tracking_handoff_yaw_, 2.0 * M_PI);
       d.yaw_rate *= blend;
     }
-    Vector3 a = d.acceleration + kp_.cwiseProduct(d.position - p) + kv_.cwiseProduct(d.velocity - v);
-    if (!a.allFinite()) a.setZero();
-    const double a_norm = a.norm();
-    if (a_norm > max_acceleration_) a *= max_acceleration_ / a_norm;
-
-    Vector3 force = a - Vector3(0.0, 0.0, gravity_);
-    if (force.norm() < 1e-6) force = Vector3(0.0, 0.0, -gravity_);
-    const double vertical_force = std::max(0.1, -force.z());
-    const double max_horizontal = vertical_force * std::tan(max_tilt_rad_);
-    const Vector3 horizontal(force.x(), force.y(), 0.0);
-    if (horizontal.norm() > max_horizontal) {
-      force.x() = horizontal.x() * max_horizontal / horizontal.norm();
-      force.y() = horizontal.y() * max_horizontal / horizontal.norm();
+    const Vector3 position_error = d.position - p;
+    const Vector3 velocity_error = d.velocity - v;
+    const bool integral_enabled = state_ == ControlState::tracking && command_fresh() &&
+      velocity_error.norm() <= integral_enable_velocity_error_mps_;
+    if (!integral_enabled || last_output_saturated_) {
+      integral_acceleration_ *= 0.995;
+    } else {
+      const double dt = last_control_time_ ? std::clamp(std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - *last_control_time_).count(), 0.0, 0.05) : 0.0;
+      integral_acceleration_ += ki_.cwiseProduct(velocity_error) * dt;
+      for (int i = 0; i < 3; ++i) {
+        integral_acceleration_(i) = std::clamp(
+          integral_acceleration_(i), -integral_limit_(i), integral_limit_(i));
+      }
+    }
+    const Vector3 integral_term = integral_acceleration_;
+    Vector3 acceleration = d.acceleration + kp_.cwiseProduct(position_error) +
+      kv_.cwiseProduct(velocity_error) + integral_term;
+    if (!acceleration.allFinite()) acceleration.setZero();
+    const double acceleration_norm = acceleration.norm();
+    bool saturated = false;
+    if (acceleration_norm > max_acceleration_) {
+      acceleration *= max_acceleration_ / acceleration_norm;
+      saturated = true;
     }
 
-    Vector3 heading = manual_yaw_ ? rotation_ * Vector3(
-      std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0) :
-      Vector3(std::cos(d.yaw), std::sin(d.yaw), 0.0);
-    heading.z() = 0.0;
-    if (heading.norm() < 1e-6) heading = Vector3(1.0, 0.0, 0.0);
-    heading.normalize();
-    const Vector3 b3 = -force.normalized();
-    Vector3 b2 = b3.cross(heading);
-    if (b2.norm() < 1e-6) b2 = Vector3(0.0, 1.0, 0.0);
-    b2.normalize();
-    const Vector3 b1 = b2.cross(b3).normalized();
-    Eigen::Matrix3d rotation;
-    rotation.col(0) = b1;
-    rotation.col(1) = b2;
-    rotation.col(2) = b3;
+    // NED specific force required from the vehicle. PX4's position controller
+    // uses the same expression: force = acceleration - [0, 0, g].
+    Vector3 force = acceleration - Vector3(0.0, 0.0, gravity_);
+    if (!force.allFinite() || force.norm() < 1e-9) {
+      force = Vector3(0.0, 0.0, -gravity_);
+    }
+    // Match PX4's limitTilt() before converting the vertical component into a
+    // collective thrust. This preserves the requested vertical acceleration
+    // when horizontal demand reaches the tilt limit.
+    Vector3 body_z = limit_body_z_tilt(-force, max_tilt_rad_);
+    const double force_down = std::max(0.1, gravity_ - acceleration.z());
+    const double body_z_down = std::max(1e-3, body_z.z());
+    double thrust = hover_thrust_ * force_down / (gravity_ * body_z_down);
+    const double unclamped_thrust = thrust;
+    thrust = std::clamp(thrust, min_thrust_, max_thrust_);
+    saturated = saturated || std::abs(unclamped_thrust - thrust) > 1e-9;
 
     ControlOutput out;
-    out.attitude = Eigen::Quaterniond(rotation).normalized();
-    out.thrust = std::clamp(force.norm() / gravity_ * hover_thrust_, min_thrust_, max_thrust_);
+    out.attitude = body_z_and_yaw_to_attitude(body_z,
+      manual_yaw_ ? std::atan2(
+        (rotation_ * Vector3(std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0)).y(),
+        (rotation_ * Vector3(std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0)).x()) : d.yaw);
+    out.thrust = thrust;
+    out.saturated = saturated;
     out.yaw_rate = std::clamp(manual_yaw_ ? 0.0 : d.yaw_rate,
       -max_yaw_rate_radps_, max_yaw_rate_radps_);
+    last_output_saturated_ = out.saturated;
+    last_control_time_ = std::chrono::steady_clock::now();
     return out;
   }
 
@@ -505,6 +679,7 @@ private:
     hover_position_ = {static_cast<double>(p.x), static_cast<double>(p.y), static_cast<double>(p.z)};
     hold_yaw_ = std::isfinite(p.heading) ? static_cast<double>(p.heading) : 0.0;
     takeoff_target_ = hover_position_;
+    takeoff_origin_z_ = hover_position_.z();
     // PX4 local z is Down, therefore a positive altitude is a negative z target.
     takeoff_target_.z() -= auto_takeoff_altitude_m_;
     takeoff_start_time_ = std::chrono::steady_clock::now();
@@ -566,7 +741,7 @@ private:
   void timer_callback()
   {
     px4_msgs::msg::OffboardControlMode mode;
-    mode.timestamp = px4_timestamp_;
+    mode.timestamp = current_px4_timestamp();
     mode.attitude = !safety_latched_;
     mode_pub_->publish(mode);
     if (safety_latched_) {
@@ -631,7 +806,12 @@ private:
     }
     const ControlOutput output = calculate_output();
     px4_msgs::msg::VehicleAttitudeSetpoint setpoint;
-    setpoint.timestamp = px4_timestamp_;
+    const uint64_t setpoint_timestamp = next_setpoint_timestamp();
+    if (setpoint_timestamp == 0) {
+      publish_status("waiting_for_px4_clock");
+      return;
+    }
+    setpoint.timestamp = setpoint_timestamp;
     setpoint.q_d = {static_cast<float>(output.attitude.w()), static_cast<float>(output.attitude.x()),
                     static_cast<float>(output.attitude.y()), static_cast<float>(output.attitude.z())};
     setpoint.thrust_body = {0.0F, 0.0F, static_cast<float>(-output.thrust)};
@@ -668,7 +848,7 @@ private:
   void publish_vehicle_command(uint16_t command, float p1, float p2)
   {
     px4_msgs::msg::VehicleCommand msg;
-    msg.timestamp = px4_timestamp_;
+    msg.timestamp = current_px4_timestamp();
     msg.param1 = p1;
     msg.param2 = p2;
     msg.command = command;
@@ -711,14 +891,24 @@ private:
   bool land_on_safety_fault_{true};
   double auto_takeoff_altitude_m_{0.5};
   double minimum_takeoff_altitude_m_{0.25};
+  double minimum_tracking_altitude_m_{0.25};
   double takeoff_duration_sec_{3.0};
   double takeoff_tolerance_m_{0.08};
   double hover_settle_sec_{0.8};
   double hover_velocity_tolerance_mps_{0.15};
   double tracking_handoff_sec_{0.75};
+  double command_blend_sec_{0.25};
+  double max_command_position_jump_m_{1.0};
+  double max_command_velocity_jump_mps_{1.5};
   double max_yaw_rate_radps_{1.5};
   Vector3 kp_{1.5, 1.5, 1.8};
   Vector3 kv_{1.2, 1.2, 1.4};
+  Vector3 ki_{0.10, 0.10, 0.15};
+  Vector3 integral_limit_{0.40, 0.40, 0.50};
+  Vector3 integral_acceleration_{Vector3::Zero()};
+  double integral_enable_velocity_error_mps_{0.60};
+  bool last_output_saturated_{false};
+  std::optional<std::chrono::steady_clock::time_point> last_control_time_;
   Matrix3 rotation_{Matrix3::Identity()};
   Vector3 translation_{Vector3::Zero()};
   bool frame_aligned_{false};
@@ -728,6 +918,10 @@ private:
   std::optional<std::chrono::steady_clock::time_point> odom_time_;
   bool odom_received_{false};
   std::optional<DesiredState> desired_;
+  std::optional<DesiredState> reference_target_;
+  DesiredState reference_blend_from_;
+  std::optional<std::chrono::steady_clock::time_point> reference_blend_start_;
+  bool reference_blending_{false};
   std::optional<DesiredState> pending_desired_;
   std::optional<std::chrono::steady_clock::time_point> desired_command_time_;
   std::optional<std::chrono::steady_clock::time_point> first_command_time_;
@@ -743,6 +937,7 @@ private:
   ControlState state_{ControlState::waiting_for_command};
   Vector3 hover_position_{Vector3::Zero()};
   Vector3 takeoff_target_{Vector3::Zero()};
+  std::optional<double> takeoff_origin_z_;
   double hold_yaw_{0.0};
   double heading_reset_offset_{0.0};
   std::optional<std::chrono::steady_clock::time_point> takeoff_start_time_;
@@ -752,6 +947,7 @@ private:
   double tracking_handoff_yaw_{0.0};
   std::optional<std::chrono::steady_clock::time_point> tracking_handoff_start_time_;
   uint64_t px4_timestamp_{0};
+  uint64_t last_setpoint_timestamp_{0};
   rclcpp::Subscription<PositionCommand>::SharedPtr command_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr status_sub_;

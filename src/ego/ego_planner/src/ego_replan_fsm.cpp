@@ -776,7 +776,9 @@ namespace ego_planner
                 else
                 {
                     next_plan_attempt_ = node_->now() + rclcpp::Duration::from_seconds(replan_retry_interval_);
-                    changeFSMExecState(REPLAN_TRAJ, "FSM");
+                    RCLCPP_ERROR(node_->get_logger(),
+                                 "Unable to validate replanned trajectory; publishing a safe hover");
+                    publishHoldTrajectory();
                 }
 
                 break;
@@ -834,7 +836,9 @@ namespace ego_planner
                         }
                         else
                         {
-                            changeFSMExecState(REPLAN_TRAJ, "FSM");
+                            RCLCPP_ERROR(node_->get_logger(),
+                                         "Unable to validate a return trajectory; publishing a safe hover");
+                            publishHoldTrajectory();
                         }
                         goto force_return;
                     }
@@ -1053,13 +1057,9 @@ namespace ego_planner
                 {
                     next_plan_attempt_ = node_->now() + rclcpp::Duration::from_seconds(replan_retry_interval_);
                     RCLCPP_ERROR(node_->get_logger(),
-                                 "No collision-free replacement trajectory; stopping now (collision lookahead %.3f s)",
+                                 "No collision-free replacement trajectory; publishing a hold (collision lookahead %.3f s)",
                                  t - t_cur);
-                    // The active trajectory is unsafe and no replacement was
-                    // validated. Require a fresh goal before leaving hold.
-                    enable_fail_safe_ = false;
-                    flag_escape_emergency_ = true;
-                    changeFSMExecState(EMERGENCY_STOP, "SAFETY_REPLAN_FAILED");
+                    publishHoldTrajectory();
                     return;
                 }
                 break;
@@ -1116,6 +1116,40 @@ namespace ego_planner
         }
 
         return plan_and_refine_success;
+    }
+
+    void EGOReplanFSM::publishHoldTrajectory()
+    {
+        if (!have_odom_ || !odom_pos_.allFinite()) {
+            return;
+        }
+        planner_manager_->EmergencyStop(odom_pos_);
+        auto info = &planner_manager_->local_data_;
+        traj_utils::msg::Bspline bspline;
+        bspline.order = 3;
+        bspline.start_time = info->start_time_;
+        bspline.traj_id = info->traj_id_;
+        const Eigen::MatrixXd points = info->position_traj_.getControlPoint();
+        bspline.pos_pts.reserve(points.cols());
+        for (int i = 0; i < points.cols(); ++i) {
+            geometry_msgs::msg::Point point;
+            point.x = odom_pos_.x();
+            point.y = odom_pos_.y();
+            point.z = odom_pos_.z();
+            bspline.pos_pts.push_back(point);
+        }
+        const Eigen::VectorXd knots = info->position_traj_.getKnot();
+        bspline.knots.reserve(knots.rows());
+        for (int i = 0; i < knots.rows(); ++i) {
+            bspline.knots.push_back(knots(i));
+        }
+        bspline_pub_->publish(bspline);
+        have_target_ = false;
+        have_new_target_ = false;
+        replan_from_odom_ = false;
+        enable_fail_safe_ = false;
+        flag_escape_emergency_ = true;
+        changeFSMExecState(WAIT_TARGET, "SAFE_HOLD");
     }
 
     void EGOReplanFSM::publishSwarmTrajs(bool startup_pub)

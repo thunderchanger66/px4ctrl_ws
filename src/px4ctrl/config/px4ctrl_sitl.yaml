@@ -43,14 +43,25 @@ px4ctrl:
     land_on_safety_fault: true
     auto_takeoff_altitude_m: 0.50
     minimum_takeoff_altitude_m: 0.25
+    # Never command EGO/PX4Ctrl below this altitude above the takeoff origin.
+    minimum_tracking_altitude_m: 0.25
     takeoff_duration_sec: 3.0
     takeoff_tolerance_m: 0.08
     hover_settle_sec: 0.80
     hover_velocity_tolerance_mps: 0.15
     tracking_handoff_sec: 0.75
+    # Smooth discontinuous EGO replans before they reach the attitude loop.
+    command_blend_sec: 0.25
+    max_command_position_jump_m: 1.0
+    max_command_velocity_jump_mps: 1.5
     max_yaw_rate_radps: 1.5
     kp: [1.5, 1.5, 1.8]
     kv: [1.2, 1.2, 1.4]
+    # Small steady-state correction, enabled only for small velocity error and
+    # decayed whenever the acceleration/thrust output is saturated.
+    ki: [0.10, 0.10, 0.15]
+    integral_limit_mps2: [0.40, 0.40, 0.50]
+    integral_enable_velocity_error_mps: 0.60
     # planner lidar frame -> PX4 local NED frame
     transform_rotation_row_major: [
       0.0, 1.0, 0.0,

@@ -84,6 +84,26 @@
 
 这不是避障验收：没有加入新障碍物，也没有验证 EGO 重规划后的连续轨迹交接。PX4Ctrl 直接输出姿态/推力并绕过 PX4 位置环，安全余度和实机性能仍需在 SITL 做多方向、多速度、扰动和障碍测试，并以 PX4 ULog 分析姿态响应、推力饱和及估计器创新后，才能考虑受控实机验证。
 
+## 2026-11-03 大范围往返复现与修复
+
+我另外做了连续任务 `0,0,0.5 -> 4,-4,0.5 -> 0,0,0.5`，原始记录为 [`test_results/2026-11-03_roundtrip_4m_before_fix.csv`](test_results/2026-11-03_roundtrip_4m_before_fix.csv)。到达 `(4,-4,0.5)` 时 PX4 仍为 armed/Offboard，定位有效；故障出现在返航重规划阶段：
+
+- EGO 日志报告 `Rejecting final trajectory: sample 5.333 s is inside inflated occupancy`，说明返航候选轨迹未通过膨胀地图碰撞检查。
+- 规划器随后反复报告 `Trajectory finished 5.62 m from goal; replanning from odometry`，但失败分支仍可能让轨迹服务器继续发布旧的、未通过验证的轨迹。
+- PX4Ctrl 没有主动触发 emergency stop；它忠实跟踪了 EGO 发布的命令。记录中 `cmd_z_lidar` 在返航失败轨迹期间降到约 `0.08 m`，所以无人机表现为下降。这不是 PX4 推力不足造成的。
+
+对应修复如下：
+
+- EGO 的重规划失败、返航失败和碰撞替代轨迹失败分支现在调用 `publishHoldTrajectory()`，用当前位置生成静止 B-spline，清除目标并进入 `WAIT_TARGET`，不会再执行失败或残留轨迹。
+- FAST-LIO/PGO bridge 对不超过 `1.50 m` 的有界回环位姿校正不再直接急停，而是递增 `VehicleOdometry.reset_counter`、将该采样速度置零并重新建立连续性；超过该阈值或超出飞行边界仍触发急停。配置项为 `max_pose_reset_jump_m`。
+- PX4Ctrl 增加 `minimum_tracking_altitude_m: 0.25`。EGO 短时发布低于安全离地高度的恢复轨迹时，控制器将其钳制到起飞原点上方 0.25 m，并清除向下速度/加速度，避免规划失败导致下降。
+
+修复后工作区重新构建通过 9 个包。连续往返复现的最后记录显示 PX4 一直保持 `nav_state=14`、armed、`dead_reckoning=0`，未收到 bridge emergency stop；返航候选轨迹仍被 EGO 的膨胀地图拒绝时，系统现在应保持当前位置等待新目标，而不是下降执行旧轨迹。修复后的正式往返验收需要在更新后的二进制上重新启动一轮，并检查 CSV 中返航失败后的 `cmd_z_lidar` 是否保持当前位置高度。
+
+本次新门控修改后已完成参数加载/节点启动冒烟测试和完整编译；尚未重新跑完 150 秒往返任务，因此最低高度钳制的最终 CSV 证据待下一轮长时仿真确认。已有修复后 CSV 证明 EGO safe hold 能保持高度，新增门控进一步覆盖其短暂低轨迹窗口。
+
+最后又修正了最低高度门控方向：若飞行器已经高于安全线，低高度命令现在保持当前高度；只有低于安全线时才爬升到安全线。修改后 `px4ctrl` 目标再次构建通过，参数加载冒烟测试正常，所有仿真进程已清理。
+
 ## 2026-11-03 姿态变化与自动降落复现
 
 PX4Ctrl 的输出链路是：EGO `/drone_0_planning/pos_cmd` 的位置、速度、加速度和 yaw 经过坐标变换与 PD 几何控制，生成期望机体四元数和 `thrust_body[2]`，发布到 `/fmu/in/vehicle_attitude_setpoint_v1`。PX4 仍执行姿态环和控制分配，但不再执行 PX4 的位置环。
@@ -115,9 +135,45 @@ PX4Ctrl 的输出链路是：EGO `/drone_0_planning/pos_cmd` 的位置、速度�
 
 ## 2026-11-03 动态轨迹回归
 
+## 2026-11-03 控制数学重构回归
+
+本轮按 PX4 `PositionControl::_accelerationControl()` 和
+`ControlMath::thrustToAttitude()` 重新核对并改写了 PX4Ctrl 的几何控制段：
+
+- 加速度误差仍使用 EGO 前馈加位置/速度 PD，但控制反馈统一为 PX4 `VehicleLocalPosition` 的 NED 状态；FAST-LIO 只用于规划输入和 PX4 外部视觉估计。
+- 期望推力先按 `f=a-[0,0,g]` 转换为 body-z，再用 PX4 同样的 `limitTilt()` 和 `bodyzToAttitude()` 构造四元数。
+- 倾角限制后按受限 body-z 的垂向投影重新计算 collective thrust，避免原先“姿态已经限倾、推力仍按限倾前力模长计算”的不一致。
+- `bringup.launch.py` 的 Micro XRCE Agent 取消 respawn，停止实验后不会再自动占用 8888 端口。
+
+构建通过：`px4ctrl` 目标包 9 个依赖组件无错误，`git diff --check` 和 Python 语法检查通过。
+
+单向 1 m 实测记录为 `test_results/2026-11-03_mathfix_1m.csv`。稳定段 RMS 三维误差约 5.1 cm，末端误差约 5.4 cm；PX4 全程保持 Offboard、armed、local position valid、非 dead-reckoning。
+
+4 m 往返实测记录为 `test_results/2026-11-03_mathfix_roundtrip.csv`。到达 `(4,-4,0.5)` 后稳定误差约 6--7 cm。返程阶段 PX4 仍保持 armed/Offboard/定位有效，记录结束时 EGO 仍在返程重规划轨迹中，末端误差约 0.35 m，未出现控制链路失控或自动降落。该轮持续 150 s，返程尚未在记录窗口内完全结束，因此不能把它记为“返回原点成功”。
+
+控制链路、坐标变换和公式的完整说明见 [`CONTROL_CHAIN.md`](CONTROL_CHAIN.md)。
+
+公开 EGO/PX4 接入方式的源码调研见 [`ONLINE_EGO_PX4_REFERENCE.md`](ONLINE_EGO_PX4_REFERENCE.md)。
+
 一轮 0.5 m 目标保持测试中，PX4 保持 armed/Offboard 30 s，EGO 命令持续有效，末端三维误差约 5.2 cm。随后发送相邻 1 m 目标验证运动段时，PX4 的 `xy/z_reset_counter` 在起飞/估计器初始化过程中变化，旧控制器把任意计数器变化当作故障并停止姿态设定点，PX4 随后进入 `AUTO_LAND`。该行为不是目标跟踪误差，而是 reset 处理过于严格。
 
 现已按 PX4 `mc_pos_control` 的处理方式修改：使用 `delta_xy`/`delta_z` 同步补偿控制器保存的 NED 目标；仅当 reset 位移超过 `max_ekf_reset_delta_m` 或偏航重置超过 `max_ekf_reset_heading_rad` 时才锁存安全故障。修改后需重新启动完整 SITL，再重复动态轨迹测试。
 
 重新启动全新 PX4/Gazebo、FAST-LIO 和 PX4Ctrl 后，动态回归成功。测试文件为
 `test_results/2026-11-03_ego_attitude_fresh_1m_motion.csv`：记录 30 s、221 个样本；其中 180 个样本处于 armed + Offboard，全部样本 `xy_valid=true` 且 `dead_reckoning=false`。EGO 轨迹从起飞点平滑推进到约 `(1.0, 0.0, 0.5)` m，末端 PX4 NED 位置约 `(0.006, 0.951, -0.506)` m，对应 lidar 位置误差 **4.4 cm**。全段 RMS 包含起飞阶段为约 0.493 m，最大误差约 0.926 m；稳定跟踪末端误差约 4-5 cm。测试结束后已停止 PX4、Gazebo、FAST-LIO 和 PX4Ctrl 进程。
+## 2026-11-03 坐标系交接修复后的独立回归
+
+本轮先停止了所有旧的 PX4/Gazebo、Micro XRCE-DDS、FAST-LIO/PGO、EGO 和 PX4Ctrl 进程，再只启动一套链路。启动初期 FAST-LIO 尚未形成有效地图约束，bridge 正确等待 PX4 local position，控制器保持未解锁；定位恢复后 bridge 完成原点对齐，才发送目标并开始记录。
+
+本轮修复了 PX4Ctrl 重规划平滑的坐标系顺序：EGO 的旧/新参考现在先在 `lidar` 坐标系中 smoothstep 混合，再统一转换到 PX4 local NED。旧实现会把 planner-frame 参考和 NED 参考直接混合，在当前轴交换矩阵下产生虚假的交接跳变。
+
+记录文件：[`test_results/2026-11-03_px4ctrl_postblend_1m.csv`](test_results/2026-11-03_px4ctrl_postblend_1m.csv)。目标为 `(1.0, 0.0, 0.5)` m，记录 45 s，共 862 个样本；所有样本 `xy_valid=1`、`z_valid=1`、`dead_reckoning=0`。PX4 在有效飞行段进入并保持 `nav_state=14`（Offboard）和 `arming_state=2`（armed）。
+
+- 最后 20 s 三维位置误差 RMS：**0.048 m**；最大 **0.054 m**。
+- 最后 10 s 三维位置误差 RMS：**0.047 m**；末端误差 **0.049 m**。
+- 末端 PX4 NED 位置约 `(-0.024, 0.957, -0.491)` m，按 `lidar=[y_ned,x_ned,-z_ned]` 换算后与目标一致。
+- 全段 RMS 为 **0.233 m**，峰值发生在起飞和控制交接阶段；稳定跟踪段保持厘米级误差。
+
+本轮验证的是单向跟踪和控制交接，不是障碍物重规划验收；返程和动态障碍仍需在地图有效、目标可达的前提下单独统计。
+
+最后又收紧了姿态设定点时间戳处理：当 PX4 输出时间戳在相邻回调中重复时，只增加 1 微秒维持严格递增，不再每次增加 1 毫秒，从而避免输出流暂时变慢时设定点时钟向未来漂移。修改后 `px4ctrl` 重新构建通过，Python 语法检查和 `git diff --check` 通过。

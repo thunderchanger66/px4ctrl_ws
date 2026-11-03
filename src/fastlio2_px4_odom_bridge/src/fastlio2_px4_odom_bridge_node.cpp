@@ -51,6 +51,10 @@ public:
     declare_parameter("max_vertical_position_m", 8.0);
     declare_parameter("max_position_step_slack_m", 0.35);
     declare_parameter("max_position_velocity_residual_m", 0.25);
+    // PGO may apply a bounded loop-closure correction to the absolute pose.
+    // Treat such a correction as an estimator reset (VehicleOdometry
+    // reset_counter) instead of converting it into an emergency stop.
+    declare_parameter("max_pose_reset_jump_m", 1.50);
     declare_parameter("max_sample_interval_sec", 0.75);
     declare_parameter("max_sample_age_sec", 0.75);
     declare_parameter("max_attitude_step_rad", 1.3);
@@ -79,6 +83,7 @@ public:
     max_position_step_slack_m_ = get_parameter("max_position_step_slack_m").as_double();
     max_position_velocity_residual_m_ =
       get_parameter("max_position_velocity_residual_m").as_double();
+    max_pose_reset_jump_m_ = get_parameter("max_pose_reset_jump_m").as_double();
     max_sample_interval_sec_ = get_parameter("max_sample_interval_sec").as_double();
     max_sample_age_sec_ = get_parameter("max_sample_age_sec").as_double();
     max_attitude_step_rad_ = get_parameter("max_attitude_step_rad").as_double();
@@ -95,6 +100,7 @@ public:
       !std::isfinite(max_position_step_slack_m_) || max_position_step_slack_m_ < 0.0 ||
       !std::isfinite(max_position_velocity_residual_m_) ||
       max_position_velocity_residual_m_ < 0.0 ||
+      !std::isfinite(max_pose_reset_jump_m_) || max_pose_reset_jump_m_ <= 0.0 ||
       !std::isfinite(max_sample_interval_sec_) || max_sample_interval_sec_ <= 0.0 ||
       !std::isfinite(max_sample_age_sec_) || max_sample_age_sec_ <= 0.0 ||
       !std::isfinite(max_attitude_step_rad_) || max_attitude_step_rad_ <= 0.0 ||
@@ -284,6 +290,7 @@ private:
       return;
     }
     bool attitude_jump = false;
+    bool pose_reset = false;
     if (last_stamp_ns_) {
       const double dt = static_cast<double>(stamp_ns - *last_stamp_ns_) / 1e9;
       if (dt <= 0.0) {
@@ -291,18 +298,32 @@ private:
         return;
       }
       const double allowed_step = max_position_step_slack_m_ + max_linear_speed_mps_ * dt;
-      if ((position_ned - *last_position_ned_).norm() > allowed_step) {
-        latch_fault("position jumped farther than the configured speed bound allows");
-        return;
+      const double position_step = (position_ned - *last_position_ned_).norm();
+      if (position_step > allowed_step) {
+        if (position_step <= max_pose_reset_jump_m_) {
+          pose_reset = true;
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            "Accepting bounded PGO pose reset: step %.3f m (limit %.3f m)",
+            position_step, max_pose_reset_jump_m_);
+        } else {
+          latch_fault("position jumped farther than the configured reset bound allows");
+          return;
+        }
       }
       attitude_jump = q_out.angularDistance(*last_orientation_) > max_attitude_step_rad_;
-      if (dt <= max_sample_interval_sec_ && !attitude_jump) {
+      if (dt <= max_sample_interval_sec_ && !attitude_jump && !pose_reset) {
         const Vector3 expected_step = 0.5 * (*last_velocity_ned_ + velocity_ned) * dt;
-        if (((position_ned - *last_position_ned_) - expected_step).norm() >
-          max_position_velocity_residual_m_)
-        {
-          latch_fault("position and velocity estimates became inconsistent");
-          return;
+        const double residual = ((position_ned - *last_position_ned_) - expected_step).norm();
+        if (residual > max_position_velocity_residual_m_) {
+          if (residual <= max_pose_reset_jump_m_) {
+            pose_reset = true;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+              "Accepting bounded PGO position/velocity reset: residual %.3f m (limit %.3f m)",
+              residual, max_pose_reset_jump_m_);
+          } else {
+            latch_fault("position and velocity estimates exceeded the configured reset bound");
+            return;
+          }
         }
       } else {
         if (dt > max_sample_interval_sec_) {
@@ -312,10 +333,19 @@ private:
         }
       }
     }
-    if (attitude_jump) {
+    if (attitude_jump || pose_reset) {
       velocity_ned.setZero();
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "FAST-LIO attitude jumped; publishing position while suppressing velocity for this sample");
+      if (pose_reset) {
+        ++reset_counter_;
+      }
+      if (pose_reset) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Publishing bounded FAST-LIO pose reset %u with zero velocity",
+          static_cast<unsigned>(reset_counter_));
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "FAST-LIO attitude jumped; publishing position while suppressing velocity for this sample");
+      }
     }
     if (px4_timestamp_us_ == 0) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -375,7 +405,7 @@ private:
       variance(msg->pose.covariance, 21, orientation_floor_),
       variance(msg->pose.covariance, 28, orientation_floor_),
       variance(msg->pose.covariance, 35, orientation_floor_)};
-    out.velocity_variance = attitude_jump ? std::array<float, 3>{100.0F, 100.0F, 100.0F} :
+    out.velocity_variance = (attitude_jump || pose_reset) ? std::array<float, 3>{100.0F, 100.0F, 100.0F} :
       std::array<float, 3>{
       variance(msg->twist.covariance, 0, velocity_floor_),
       variance(msg->twist.covariance, 7, velocity_floor_),
@@ -410,6 +440,7 @@ private:
   double max_vertical_position_m_{8.0};
   double max_position_step_slack_m_{0.35};
   double max_position_velocity_residual_m_{0.25};
+  double max_pose_reset_jump_m_{1.50};
   double max_sample_interval_sec_{0.75};
   double max_sample_age_sec_{0.75};
   double max_attitude_step_rad_{1.3};
