@@ -95,6 +95,7 @@ public:
     declare_parameter("max_tilt_deg", 30.0);
     declare_parameter("max_acceleration_mps2", 4.0);
     declare_parameter("local_position_timeout_sec", 0.50);
+    declare_parameter("local_position_fault_delay_sec", 1.00);
     declare_parameter("max_ekf_reset_delta_m", 1.0);
     declare_parameter("max_ekf_reset_heading_rad", 0.35);
     declare_parameter("require_local_position_valid", true);
@@ -129,6 +130,7 @@ public:
     max_tilt_rad_ = get_parameter("max_tilt_deg").as_double() * M_PI / 180.0;
     max_acceleration_ = get_parameter("max_acceleration_mps2").as_double();
     local_position_timeout_sec_ = get_parameter("local_position_timeout_sec").as_double();
+    local_position_fault_delay_sec_ = get_parameter("local_position_fault_delay_sec").as_double();
     max_ekf_reset_delta_m_ = get_parameter("max_ekf_reset_delta_m").as_double();
     max_ekf_reset_heading_rad_ = get_parameter("max_ekf_reset_heading_rad").as_double();
     require_local_position_valid_ = get_parameter("require_local_position_valid").as_bool();
@@ -159,6 +161,7 @@ public:
         min_thrust_ >= max_thrust_ || !std::isfinite(max_tilt_rad_) || max_tilt_rad_ <= 0.0 ||
         max_tilt_rad_ >= M_PI_2 || !std::isfinite(max_acceleration_) || max_acceleration_ <= 0.0 ||
         !std::isfinite(local_position_timeout_sec_) || local_position_timeout_sec_ <= 0.0 ||
+        !std::isfinite(local_position_fault_delay_sec_) || local_position_fault_delay_sec_ <= 0.0 ||
         !std::isfinite(max_ekf_reset_delta_m_) || max_ekf_reset_delta_m_ <= 0.0 ||
         !std::isfinite(max_ekf_reset_heading_rad_) || max_ekf_reset_heading_rad_ <= 0.0 ||
         !std::isfinite(max_local_position_m_) || max_local_position_m_ <= 0.0 ||
@@ -307,10 +310,16 @@ private:
       msg->z_reset_counter != local_position_->z_reset_counter ||
       msg->heading_reset_counter != local_position_->heading_reset_counter);
     if (local_frame_reset && frame_aligned_) {
+      const bool xy_reset = msg->xy_reset_counter != local_position_->xy_reset_counter;
+      const bool z_reset = msg->z_reset_counter != local_position_->z_reset_counter;
+      const bool heading_reset =
+        msg->heading_reset_counter != local_position_->heading_reset_counter;
       const Vector3 reset_delta(
-        static_cast<double>(msg->delta_xy[0]), static_cast<double>(msg->delta_xy[1]),
-        static_cast<double>(msg->delta_z));
-      const double heading_delta = static_cast<double>(msg->delta_heading);
+        xy_reset ? static_cast<double>(msg->delta_xy[0]) : 0.0,
+        xy_reset ? static_cast<double>(msg->delta_xy[1]) : 0.0,
+        z_reset ? static_cast<double>(msg->delta_z) : 0.0);
+      const double heading_delta = heading_reset ?
+        static_cast<double>(msg->delta_heading) : 0.0;
       if (!finite(reset_delta) || !std::isfinite(heading_delta) ||
         reset_delta.norm() > max_ekf_reset_delta_m_ ||
         std::abs(heading_delta) > max_ekf_reset_heading_rad_)
@@ -324,6 +333,12 @@ private:
         hover_position_ += reset_delta;
         takeoff_target_ += reset_delta;
         tracking_handoff_position_ += reset_delta;
+        // PX4's position controller keeps its local-frame setpoints valid
+        // across a heading reset by adding delta_heading to the yaw setpoint.
+        // Keep the same offset for the direct attitude path instead of
+        // treating a normal estimator yaw reset as a flight failure.
+        heading_reset_offset_ = std::remainder(
+          heading_reset_offset_ + heading_delta, 2.0 * M_PI);
         RCLCPP_WARN(get_logger(),
           "Compensating PX4 local-position reset: delta [%.3f %.3f %.3f] m",
           reset_delta.x(), reset_delta.y(), reset_delta.z());
@@ -420,6 +435,7 @@ private:
     const Vector3 heading_rate_in_ned = rotation_ * Vector3(
       -std::sin(d.yaw) * d.yaw_rate, std::cos(d.yaw) * d.yaw_rate, 0.0);
     d.yaw = std::atan2(heading_in_ned.y(), heading_in_ned.x());
+    d.yaw = std::remainder(d.yaw + heading_reset_offset_, 2.0 * M_PI);
     const double heading_norm_sq = heading_in_ned.head<2>().squaredNorm();
     d.yaw_rate = heading_norm_sq > 1e-8 ?
       (heading_in_ned.x() * heading_rate_in_ned.y() -
@@ -557,11 +573,17 @@ private:
       publish_status("safety_latched_no_setpoint");
       return;
     }
+    const auto now = std::chrono::steady_clock::now();
     if (!state_fresh()) {
       if (vehicle_status_ && vehicle_status_->arming_state !=
         px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
       {
-        latch_safety_fault("fastlio_odom_timeout");
+        if (!unhealthy_since_) unhealthy_since_ = now;
+        if (std::chrono::duration<double>(now - *unhealthy_since_).count() >=
+          local_position_fault_delay_sec_)
+        {
+          latch_safety_fault("fastlio_odom_timeout");
+        }
       } else {
         publish_status("waiting_for_fresh_fastlio_odom");
       }
@@ -571,10 +593,16 @@ private:
       publish_status("waiting_for_healthy_px4_local_position");
       if (vehicle_status_ && vehicle_status_->arming_state !=
         px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED) {
-        latch_safety_fault("px4_local_position_unhealthy");
+        if (!unhealthy_since_) unhealthy_since_ = now;
+        if (std::chrono::duration<double>(now - *unhealthy_since_).count() >=
+          local_position_fault_delay_sec_)
+        {
+          latch_safety_fault("px4_local_position_unhealthy");
+        }
       }
       return;
     }
+    unhealthy_since_.reset();
 
     if (!align_frames_if_stationary()) {
       publish_status("waiting_for_stationary_frame_alignment");
@@ -672,6 +700,7 @@ private:
   double max_tilt_rad_{0.52};
   double max_acceleration_{4.0};
   double local_position_timeout_sec_{0.5};
+  double local_position_fault_delay_sec_{1.0};
   double max_ekf_reset_delta_m_{1.0};
   double max_ekf_reset_heading_rad_{0.35};
   bool require_local_position_valid_{true};
@@ -707,6 +736,7 @@ private:
   std::optional<px4_msgs::msg::VehicleStatus> vehicle_status_;
   std::optional<px4_msgs::msg::VehicleLocalPosition> local_position_;
   std::optional<std::chrono::steady_clock::time_point> local_position_time_;
+  std::optional<std::chrono::steady_clock::time_point> unhealthy_since_;
   bool local_position_received_{false};
   bool safety_latched_{false};
   bool command_seen_{false};
@@ -714,6 +744,7 @@ private:
   Vector3 hover_position_{Vector3::Zero()};
   Vector3 takeoff_target_{Vector3::Zero()};
   double hold_yaw_{0.0};
+  double heading_reset_offset_{0.0};
   std::optional<std::chrono::steady_clock::time_point> takeoff_start_time_;
   std::optional<std::chrono::steady_clock::time_point> hover_settle_start_time_;
   Vector3 tracking_handoff_position_{Vector3::Zero()};

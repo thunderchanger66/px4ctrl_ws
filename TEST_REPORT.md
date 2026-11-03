@@ -84,6 +84,18 @@
 
 这不是避障验收：没有加入新障碍物，也没有验证 EGO 重规划后的连续轨迹交接。PX4Ctrl 直接输出姿态/推力并绕过 PX4 位置环，安全余度和实机性能仍需在 SITL 做多方向、多速度、扰动和障碍测试，并以 PX4 ULog 分析姿态响应、推力饱和及估计器创新后，才能考虑受控实机验证。
 
+## 2026-11-03 姿态变化与自动降落复现
+
+PX4Ctrl 的输出链路是：EGO `/drone_0_planning/pos_cmd` 的位置、速度、加速度和 yaw 经过坐标变换与 PD 几何控制，生成期望机体四元数和 `thrust_body[2]`，发布到 `/fmu/in/vehicle_attitude_setpoint_v1`。PX4 仍执行姿态环和控制分配，但不再执行 PX4 的位置环。
+
+测试得到两种不同的降落原因：
+
+- 单独发送 90 deg 航向目标时，车辆保持 armed/Offboard，未进入 dead-reckoning，说明大 yaw 变化本身不会触发降落。原始 1 m 多场景测试中，PX4 local position 报告 `delta_xy=[-0.244,-1.125] m`，旧的 `max_ekf_reset_delta_m=1.0` 将其判为故障，PX4Ctrl 发布 `NAV_LAND`。现已把 SITL 阈值设为 3.0 m，并按 PX4 `MulticopterPositionControl` 同步补偿 `delta_xy`、`delta_z` 和 `delta_heading`；另外加入 1 s 连续故障确认，避免短暂估计器间隙立即降落。
+- 使用 PGO 时，回环优化会改变 FAST-LIO 世界位姿，可能产生较大的外部视觉 reset。该场景应作为定位压力测试，不能与纯控制器跟踪误差混合统计。
+- 不含 PGO 的测试中，EGO 对回到 `(0,0,0.5)` 的目标报 `occupied or out-of-map`，随后进入 `EMERGENCY_STOP`。EGO 的 `/planning/emergency_stop` 被 PX4Ctrl 订阅后会主动发送 `NAV_LAND`，所以这类降落来自规划器安全策略，不是姿态四元数或推力计算。
+
+复现数据：`test_results/2026-11-03_turn_90.csv`、`test_results/2026-11-03_multiscene.csv`、`test_results/2026-11-03_lio_multiscene.csv`。修复后的配置和代码已通过 `colcon build --packages-select px4ctrl --symlink-install --executor sequential` 与 `git diff --check`。
+
 ## 2026-11-03 坐标对齐回归复测
 
 本次代码复核发现原控制器把 planner `lidar` 位置仅做旋转，而 EV 桥接器会额外将 FAST-LIO 原点平移对齐到 PX4 local NED。现已在控制器启动时以静止状态计算并应用同一类平移；PX4 local position reset 在已解锁时触发锁存故障，未解锁时重新对齐。另修复 FAST-LIO 超时后控制器仍持续刷新 Offboard 模式、却不再发送姿态设定点的失效路径：已解锁时现请求 PX4 降落。

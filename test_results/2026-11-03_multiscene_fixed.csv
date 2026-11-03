@@ -1,0 +1,1 @@
+elapsed_s,cmd_x_lidar,cmd_y_lidar,cmd_z_lidar,cmd_vx_lidar,cmd_vy_lidar,cmd_vz_lidar,cmd_yaw_lidar,px4_x_ned,px4_y_ned,px4_z_ned,px4_vx_ned,px4_vy_ned,px4_vz_ned,xy_valid,z_valid,dead_reckoning,nav_state,arming_state
