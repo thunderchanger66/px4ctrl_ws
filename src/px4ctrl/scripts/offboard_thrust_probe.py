@@ -35,6 +35,9 @@ class ThrustProbe(Node):
         self.status = None
         self.position = None
         self.attitude = None
+        self.status_wall_time = None
+        self.position_wall_time = None
+        self.attitude_wall_time = None
         self.px4_timestamp = 0
         self.px4_stamp_wall = None
         self.create_subscription(
@@ -59,17 +62,20 @@ class ThrustProbe(Node):
 
     def status_cb(self, msg):
         self.status = msg
+        self.status_wall_time = time.monotonic()
 
     def position_cb(self, msg):
         self.position = msg
         self.px4_timestamp = max(self.px4_timestamp, msg.timestamp)
         self.px4_stamp_wall = time.monotonic()
+        self.position_wall_time = self.px4_stamp_wall
 
     def attitude_cb(self, msg):
         if msg.timestamp:
             self.attitude = msg
             self.px4_timestamp = max(self.px4_timestamp, msg.timestamp)
             self.px4_stamp_wall = time.monotonic()
+            self.attitude_wall_time = self.px4_stamp_wall
 
     def now_us(self):
         if self.px4_timestamp == 0:
@@ -95,7 +101,7 @@ class ThrustProbe(Node):
 
     def position_healthy(self):
         p = self.position
-        return bool(
+        if not (
             p
             and self.attitude
             and p.timestamp
@@ -104,7 +110,20 @@ class ThrustProbe(Node):
             and p.v_xy_valid
             and p.v_z_valid
             and not p.dead_reckoning
-        )
+            and self.status_wall_time is not None
+            and time.monotonic() - self.status_wall_time < 0.5
+            and self.position_wall_time is not None
+            and time.monotonic() - self.position_wall_time < 0.5
+            and self.attitude_wall_time is not None
+            and time.monotonic() - self.attitude_wall_time < 0.5
+        ):
+            return False
+        state = (p.x, p.y, p.z, p.vx, p.vy, p.vz)
+        quaternion = self.attitude.q
+        if not all(math.isfinite(float(value)) for value in state + tuple(quaternion)):
+            return False
+        norm = math.sqrt(sum(float(component) ** 2 for component in quaternion))
+        return 0.5 <= norm <= 1.5
 
     def publish_setpoint(self, thrust):
         timestamp = self.now_us()
@@ -116,6 +135,8 @@ class ThrustProbe(Node):
         sp.timestamp = timestamp
         q = self.attitude.q
         q_norm = math.sqrt(sum(float(component) ** 2 for component in q))
+        if not math.isfinite(q_norm) or q_norm < 1e-6:
+            return
         sp.q_d = [float(component) / q_norm for component in q]
         sp.thrust_body = [0.0, 0.0, -float(thrust)]
         sp.yaw_sp_move_rate = math.nan
@@ -223,10 +244,15 @@ def main():
     parser.add_argument("--land-wait", type=float, default=20.0)
     parser.add_argument("--thrust-steps", type=float, nargs="+", default=[0.55, 0.65, 0.75, 0.85, 0.90])
     args = parser.parse_args()
-    if not args.thrust_steps or any(not 0.0 < value <= 0.9 for value in args.thrust_steps):
+    if not args.thrust_steps or any(
+        not math.isfinite(value) or not 0.0 < value <= 0.9
+        for value in args.thrust_steps
+    ):
         parser.error("thrust steps must be in (0, 0.9]")
-    if args.step_duration <= 0 or args.ramp_duration <= 0 or args.timeout <= 0:
-        parser.error("durations must be positive")
+    durations = (args.prestream_sec, args.timeout, args.step_duration,
+                 args.ramp_duration, args.max_climb_m, args.land_wait)
+    if any(not math.isfinite(value) or value <= 0.0 for value in durations):
+        parser.error("prestream, timeout, step, ramp, climb and land durations must be finite and positive")
     rclpy.init()
     node = ThrustProbe(args)
     try:

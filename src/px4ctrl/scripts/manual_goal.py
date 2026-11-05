@@ -39,8 +39,13 @@ def parse_args():
         values.append(args.yaw_deg)
     if not all(math.isfinite(value) for value in values):
         parser.error("coordinates and yaw must be finite")
-    if args.wait_timeout <= 0.0 or args.publish_count < 1:
-        parser.error("wait-timeout must be positive and publish-count must be at least one")
+    if not math.isfinite(args.wait_timeout) or args.wait_timeout <= 0.0 or args.publish_count < 1:
+        parser.error("wait-timeout must be finite and positive; publish-count must be at least one")
+    if any(not value.strip() for value in (
+        args.frame, args.goal_topic, args.odom_topic, args.command_topic,
+        args.manual_yaw_topic, args.clear_manual_yaw_topic,
+    )):
+        parser.error("frame and topic names must not be empty")
     return args
 
 
