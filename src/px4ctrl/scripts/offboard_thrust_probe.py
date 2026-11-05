@@ -49,7 +49,7 @@ class ThrustProbe(Node):
         self.create_subscription(
             VehicleAttitude, "/fmu/out/vehicle_attitude", self.attitude_cb, self.px4_qos
         )
-        self.start_time = time.monotonic()
+        self.start_time = self.get_clock().now()
         self.last_command_time = 0.0
         self.armed_at = None
         self.started_at = None
@@ -76,6 +76,9 @@ class ThrustProbe(Node):
             return 0
         elapsed = time.monotonic() - self.px4_stamp_wall if self.px4_stamp_wall else 0.0
         return self.px4_timestamp + int(elapsed * 1e6)
+
+    def seconds_since(self, timestamp):
+        return max(0.0, (self.get_clock().now() - timestamp).nanoseconds * 1e-9)
 
     def publish_command(self, command, param1=0.0, param2=0.0):
         msg = VehicleCommand()
@@ -119,7 +122,7 @@ class ThrustProbe(Node):
         self.setpoint_pub.publish(sp)
 
     def tick(self):
-        elapsed = time.monotonic() - self.start_time
+        elapsed = self.seconds_since(self.start_time)
         if elapsed > self.args.timeout:
             self.finish("timeout_before_takeoff")
             return
@@ -140,12 +143,12 @@ class ThrustProbe(Node):
                 self.last_command_time = elapsed
 
         if armed and nav_offboard and self.armed_at is None:
-            self.armed_at = time.monotonic()
+            self.armed_at = self.get_clock().now()
             self.get_logger().info("PX4 armed in Offboard; starting bounded thrust ramp")
         if self.armed_at is None:
             return
 
-        age = time.monotonic() - self.armed_at
+        age = self.seconds_since(self.armed_at)
         p = self.position
         row = {
             "elapsed_s": round(age, 3),
@@ -171,7 +174,7 @@ class ThrustProbe(Node):
             self.finish("ramp_complete")
 
     def current_thrust(self):
-        age = time.monotonic() - self.armed_at if self.armed_at else 0.0
+        age = self.seconds_since(self.armed_at) if self.armed_at else 0.0
         step = min(int(age / self.args.step_duration), len(self.args.thrust_steps) - 1)
         return self.args.thrust_steps[step]
 

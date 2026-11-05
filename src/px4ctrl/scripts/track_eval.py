@@ -4,13 +4,20 @@
 import argparse
 import csv
 import math
-import time
 
 import rclpy
-from px4_msgs.msg import VehicleLocalPosition, VehicleStatus
+from px4_msgs.msg import (
+    FailsafeFlags,
+    VehicleAttitude,
+    VehicleAttitudeSetpoint,
+    VehicleLandDetected,
+    VehicleLocalPosition,
+    VehicleStatus,
+)
 from quadrotor_msgs.msg import PositionCommand
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Empty, String
 
 
 class TrackEval(Node):
@@ -27,7 +34,13 @@ class TrackEval(Node):
         self.command = None
         self.position = None
         self.status = None
-        self.started = time.monotonic()
+        self.attitude = None
+        self.attitude_setpoint = None
+        self.failsafe = None
+        self.land = None
+        self.controller_status = ""
+        self.planner_emergency_count = 0
+        self.started = self.get_clock().now()
         self.create_subscription(
             PositionCommand, "/drone_0_planning/pos_cmd", self.command_cb, 20
         )
@@ -39,6 +52,25 @@ class TrackEval(Node):
         )
         self.create_subscription(
             VehicleStatus, "/fmu/out/vehicle_status_v4", self.status_cb, sensor_qos
+        )
+        self.create_subscription(
+            VehicleAttitude, "/fmu/out/vehicle_attitude", self.attitude_cb, sensor_qos
+        )
+        self.create_subscription(
+            VehicleAttitudeSetpoint,
+            "/fmu/in/vehicle_attitude_setpoint_v1",
+            self.attitude_setpoint_cb,
+            sensor_qos,
+        )
+        self.create_subscription(
+            FailsafeFlags, "/fmu/out/failsafe_flags", self.failsafe_cb, sensor_qos
+        )
+        self.create_subscription(
+            VehicleLandDetected, "/fmu/out/vehicle_land_detected", self.land_cb, sensor_qos
+        )
+        self.create_subscription(String, "/px4ctrl/status", self.controller_status_cb, 10)
+        self.create_subscription(
+            Empty, "/planning/emergency_stop", self.emergency_cb, 10
         )
         self.timer = self.create_timer(0.05, self.record)
 
@@ -53,9 +85,27 @@ class TrackEval(Node):
     def status_cb(self, msg):
         self.status = msg
 
+    def attitude_cb(self, msg):
+        self.attitude = msg
+
+    def attitude_setpoint_cb(self, msg):
+        self.attitude_setpoint = msg
+
+    def failsafe_cb(self, msg):
+        self.failsafe = msg
+
+    def land_cb(self, msg):
+        self.land = msg
+
+    def controller_status_cb(self, msg):
+        self.controller_status = msg.data
+
+    def emergency_cb(self, _msg):
+        self.planner_emergency_count += 1
+
     def record(self):
-        now = time.monotonic()
-        if now - self.started >= self.args.duration:
+        elapsed = max(0.0, (self.get_clock().now() - self.started).nanoseconds * 1e-9)
+        if elapsed >= self.args.duration:
             self.write_csv()
             rclpy.shutdown()
             return
@@ -65,7 +115,7 @@ class TrackEval(Node):
         if c is None or p is None:
             return
         self.rows.append({
-            "elapsed_s": now - self.started,
+            "elapsed_s": elapsed,
             "cmd_x_lidar": c.position.x,
             "cmd_y_lidar": c.position.y,
             "cmd_z_lidar": c.position.z,
@@ -84,6 +134,27 @@ class TrackEval(Node):
             "dead_reckoning": int(p.dead_reckoning),
             "nav_state": s.nav_state if s else -1,
             "arming_state": s.arming_state if s else -1,
+            "failsafe": int(s.failsafe) if s else -1,
+            "offboard_signal_lost": int(self.failsafe.offboard_control_signal_lost)
+            if self.failsafe else -1,
+            "landed": int(self.land.landed) if self.land else -1,
+            "maybe_landed": int(self.land.maybe_landed) if self.land else -1,
+            "att_q_w": self.attitude.q[0] if self.attitude else math.nan,
+            "att_q_x": self.attitude.q[1] if self.attitude else math.nan,
+            "att_q_y": self.attitude.q[2] if self.attitude else math.nan,
+            "att_q_z": self.attitude.q[3] if self.attitude else math.nan,
+            "sp_q_w": self.attitude_setpoint.q_d[0] if self.attitude_setpoint else math.nan,
+            "sp_q_x": self.attitude_setpoint.q_d[1] if self.attitude_setpoint else math.nan,
+            "sp_q_y": self.attitude_setpoint.q_d[2] if self.attitude_setpoint else math.nan,
+            "sp_q_z": self.attitude_setpoint.q_d[3] if self.attitude_setpoint else math.nan,
+            "thrust_x": self.attitude_setpoint.thrust_body[0]
+            if self.attitude_setpoint else math.nan,
+            "thrust_y": self.attitude_setpoint.thrust_body[1]
+            if self.attitude_setpoint else math.nan,
+            "thrust_z": self.attitude_setpoint.thrust_body[2]
+            if self.attitude_setpoint else math.nan,
+            "px4ctrl_status": self.controller_status,
+            "planner_emergency_count": self.planner_emergency_count,
         })
 
     def write_csv(self):
@@ -92,7 +163,12 @@ class TrackEval(Node):
             "cmd_vx_lidar", "cmd_vy_lidar", "cmd_vz_lidar", "cmd_yaw_lidar",
             "px4_x_ned", "px4_y_ned", "px4_z_ned", "px4_vx_ned",
             "px4_vy_ned", "px4_vz_ned", "xy_valid", "z_valid",
-            "dead_reckoning", "nav_state", "arming_state",
+            "dead_reckoning", "nav_state", "arming_state", "failsafe",
+            "offboard_signal_lost", "landed", "maybe_landed",
+            "att_q_w", "att_q_x", "att_q_y", "att_q_z",
+            "sp_q_w", "sp_q_x", "sp_q_y", "sp_q_z",
+            "thrust_x", "thrust_y", "thrust_z", "px4ctrl_status",
+            "planner_emergency_count",
         ]
         with open(self.args.csv, "w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)

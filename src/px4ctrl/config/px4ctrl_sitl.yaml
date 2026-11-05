@@ -52,7 +52,7 @@ px4ctrl:
     tracking_handoff_sec: 0.75
     # Smooth discontinuous EGO replans before they reach the attitude loop.
     command_blend_sec: 0.25
-    max_command_position_jump_m: 1.0
+    max_command_position_jump_m: 0.35
     max_command_velocity_jump_mps: 1.5
     max_yaw_rate_radps: 1.5
     kp: [1.5, 1.5, 1.8]

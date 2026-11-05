@@ -45,7 +45,11 @@ source ~/GRA_1/px4ctrl_ws/install/setup.bash
 ros2 run px4ctrl manual_goal 1.5 -1.0 0.5 0 --wait-timeout 30
 ```
 
-The attitude/thrust loop runs at 100 Hz. `auto_takeoff_altitude_m`,
+The attitude/thrust loop runs at 100 Hz of the configured ROS clock. SITL uses
+Gazebo `/clock`, so controller, EGO planning, and trajectory sampling all slow
+or pause together when simulation does. For hardware, use a parameter file with
+`use_sim_time: false`. PX4 uORB timestamps still come from PX4 output messages.
+`auto_takeoff_altitude_m`,
 `takeoff_duration_sec`, `hover_settle_sec`, and
 `hover_velocity_tolerance_mps` are in `config/px4ctrl_sitl.yaml`. At the
 hover-to-tracking transition, the commanded reference blends from the measured

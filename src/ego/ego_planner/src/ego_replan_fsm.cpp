@@ -319,6 +319,11 @@ namespace ego_planner
 
         Eigen::Vector3d end_wp(
             msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+        if (have_target_ && (end_pt_ - end_wp).norm() <= 1e-3)
+        {
+            RCLCPP_DEBUG(node_->get_logger(), "Ignoring duplicate active goal");
+            return;
+        }
         if (!end_wp.allFinite() || !planner_manager_->grid_map_->isInMap(end_wp))
         {
             RCLCPP_ERROR(node_->get_logger(), "Rejecting goal outside the configured occupancy-map bounds: %.2f %.2f %.2f",

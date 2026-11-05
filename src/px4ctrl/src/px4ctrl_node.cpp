@@ -156,7 +156,7 @@ public:
     declare_parameter("hover_velocity_tolerance_mps", 0.15);
     declare_parameter("tracking_handoff_sec", 0.75);
     declare_parameter("command_blend_sec", 0.25);
-    declare_parameter("max_command_position_jump_m", 1.0);
+    declare_parameter("max_command_position_jump_m", 0.35);
     declare_parameter("max_command_velocity_jump_mps", 1.5);
     declare_parameter("max_yaw_rate_radps", 1.5);
     declare_parameter("kp", std::vector<double>{1.5, 1.5, 1.8});
@@ -215,9 +215,11 @@ public:
         !std::isfinite(command_timeout_sec_) || command_timeout_sec_ <= 0.0 ||
         !std::isfinite(prestream_seconds_) || prestream_seconds_ < 0.0 ||
         !std::isfinite(gravity_) || gravity_ <= 0.0 || !std::isfinite(hover_thrust_) ||
-        hover_thrust_ <= 0.0 || hover_thrust_ >= 1.0 || !std::isfinite(min_thrust_) ||
+        hover_thrust_ <= 0.0 || hover_thrust_ >= 1.0 ||
+        !std::isfinite(min_thrust_) ||
         !std::isfinite(max_thrust_) || min_thrust_ < 0.0 || max_thrust_ > 1.0 ||
-        min_thrust_ >= max_thrust_ || !std::isfinite(max_tilt_rad_) || max_tilt_rad_ <= 0.0 ||
+        min_thrust_ >= max_thrust_ || hover_thrust_ <= min_thrust_ ||
+        hover_thrust_ >= max_thrust_ || !std::isfinite(max_tilt_rad_) || max_tilt_rad_ <= 0.0 ||
         max_tilt_rad_ >= M_PI_2 || !std::isfinite(max_acceleration_) || max_acceleration_ <= 0.0 ||
         !std::isfinite(local_position_timeout_sec_) || local_position_timeout_sec_ <= 0.0 ||
         !std::isfinite(local_position_fault_delay_sec_) || local_position_fault_delay_sec_ <= 0.0 ||
@@ -285,7 +287,7 @@ public:
       std::bind(&Px4Ctrl::local_position_callback, this, std::placeholders::_1));
     emergency_sub_ = create_subscription<std_msgs::msg::Empty>(
       "/planning/emergency_stop", rclcpp::QoS(10),
-      [this](const std_msgs::msg::Empty::SharedPtr) { latch_safety_fault("external_emergency_stop"); });
+      std::bind(&Px4Ctrl::planner_emergency_callback, this, std::placeholders::_1));
     manual_yaw_sub_ = create_subscription<std_msgs::msg::Float64>(
       get_parameter("manual_yaw_topic").as_string(), rclcpp::QoS(10),
       [this](const std_msgs::msg::Float64::SharedPtr msg) {
@@ -306,7 +308,7 @@ public:
 
     const double rate = get_parameter("publish_rate_hz").as_double();
     if (!std::isfinite(rate) || rate < 10.0) throw std::runtime_error("publish_rate_hz must be >= 10");
-    timer_ = create_wall_timer(
+    timer_ = create_timer(
       std::chrono::duration<double>(1.0 / rate), std::bind(&Px4Ctrl::timer_callback, this));
     publish_status("waiting_for_fastlio_odom_and_planner_command");
   }
@@ -341,7 +343,7 @@ private:
        velocity_jump > max_command_velocity_jump_mps_))
     {
       reference_blend_from_ = desired_.value_or(previous_target);
-      reference_blend_start_ = std::chrono::steady_clock::now();
+      reference_blend_start_ = get_clock()->now();
       reference_blending_ = command_blend_sec_ > 1e-6;
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
         "Blending discontinuous EGO command: position jump %.2f m, velocity jump %.2f m/s",
@@ -350,8 +352,9 @@ private:
     desired_ = candidate;
     reference_target_ = candidate;
     pending_desired_ = candidate;
-    desired_command_time_ = std::chrono::steady_clock::now();
+    desired_command_time_ = get_clock()->now();
     command_seen_ = true;
+    planner_emergency_hold_ = false;
     if (!first_command_time_) first_command_time_ = desired_command_time_;
   }
 
@@ -379,7 +382,7 @@ private:
     odom_position_ = p;
     odom_velocity_ = v;
     odom_orientation_ = q;
-    odom_time_ = std::chrono::steady_clock::now();
+    odom_time_ = get_clock()->now();
     odom_received_ = true;
   }
 
@@ -448,6 +451,9 @@ private:
         translation_ += reset_delta;
         hover_position_ += reset_delta;
         takeoff_target_ += reset_delta;
+        if (z_reset && takeoff_origin_z_) {
+          *takeoff_origin_z_ += reset_delta.z();
+        }
         tracking_handoff_position_ += reset_delta;
         // PX4's position controller keeps its local-frame setpoints valid
         // across a heading reset by adding delta_heading to the yaw setpoint.
@@ -455,14 +461,20 @@ private:
         // treating a normal estimator yaw reset as a flight failure.
         heading_reset_offset_ = std::remainder(
           heading_reset_offset_ + heading_delta, 2.0 * M_PI);
+        hold_yaw_ = std::remainder(hold_yaw_ + heading_delta, 2.0 * M_PI);
+        tracking_handoff_yaw_ = std::remainder(
+          tracking_handoff_yaw_ + heading_delta, 2.0 * M_PI);
+        if (yaw_setpoint_) {
+          *yaw_setpoint_ = std::remainder(*yaw_setpoint_ + heading_delta, 2.0 * M_PI);
+        }
         RCLCPP_WARN(get_logger(),
-          "Compensating PX4 local-position reset: delta [%.3f %.3f %.3f] m",
-          reset_delta.x(), reset_delta.y(), reset_delta.z());
+          "Compensating PX4 local reset: delta [%.3f %.3f %.3f] m, heading %.3f rad",
+          reset_delta.x(), reset_delta.y(), reset_delta.z(), heading_delta);
       }
     }
     local_position_ = *msg;
     update_px4_clock(msg->timestamp);
-    local_position_time_ = std::chrono::steady_clock::now();
+    local_position_time_ = get_clock()->now();
     local_position_received_ = true;
   }
 
@@ -470,8 +482,7 @@ private:
   {
     if (!require_local_position_valid_) return true;
     if (!local_position_received_ || !local_position_time_) return false;
-    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - *local_position_time_).count() >
-      local_position_timeout_sec_) return false;
+    if (seconds_since(*local_position_time_) > local_position_timeout_sec_) return false;
     const auto & p = *local_position_;
     if (p.timestamp == 0 || !p.xy_valid || !p.z_valid || !p.v_xy_valid || !p.v_z_valid || p.dead_reckoning) return false;
     const double position_norm = std::hypot(std::hypot(static_cast<double>(p.x), static_cast<double>(p.y)),
@@ -480,6 +491,11 @@ private:
       static_cast<double>(p.vz));
     return std::isfinite(position_norm) && std::isfinite(velocity_norm) &&
       position_norm <= max_local_position_m_ && velocity_norm <= max_local_velocity_mps_;
+  }
+
+  double seconds_since(const rclcpp::Time & earlier) const
+  {
+    return std::max(0.0, (get_clock()->now() - earlier).seconds());
   }
 
   void latch_safety_fault(const std::string & reason)
@@ -495,24 +511,43 @@ private:
     }
   }
 
+  void planner_emergency_callback(const std_msgs::msg::Empty::SharedPtr)
+  {
+    if (!local_position_healthy()) {
+      latch_safety_fault("planner_emergency_without_healthy_px4_position");
+      return;
+    }
+
+    const auto & p = *local_position_;
+    hover_position_ = {static_cast<double>(p.x), static_cast<double>(p.y), static_cast<double>(p.z)};
+    hold_yaw_ = std::isfinite(p.heading) ? static_cast<double>(p.heading) : hold_yaw_;
+    hover_settle_start_time_ = get_clock()->now();
+    desired_command_time_.reset();
+    pending_desired_.reset();
+    reference_blending_ = false;
+    tracking_handoff_start_time_.reset();
+    integral_acceleration_.setZero();
+    state_ = ControlState::hover;
+    planner_emergency_hold_ = true;
+    publish_status("planner_emergency_hold");
+    RCLCPP_WARN(get_logger(), "Planner emergency: holding current PX4 position");
+  }
+
   bool state_fresh() const
   {
     // PX4 local position is the state used by the feedback controller. FAST-
     // LIO is needed before alignment, but after that it is an upstream input
     // to the estimator/planner rather than a second control-state source.
     if (frame_aligned_) return local_position_received_ && local_position_time_ &&
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - *local_position_time_).count() <=
-        local_position_timeout_sec_;
+        seconds_since(*local_position_time_) <= local_position_timeout_sec_;
     return odom_position_ && odom_velocity_ && odom_time_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - *odom_time_).count() <=
-      state_timeout_sec_;
+      seconds_since(*odom_time_) <= state_timeout_sec_;
   }
 
   bool command_fresh() const
   {
     return pending_desired_ && desired_command_time_ &&
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - *desired_command_time_).count() <=
-      command_timeout_sec_;
+      seconds_since(*desired_command_time_) <= command_timeout_sec_;
   }
 
   bool align_frames_if_stationary()
@@ -556,8 +591,7 @@ private:
     // transform mixes a previous planner-frame state with a NED state and can
     // create a false position/yaw step when axes are exchanged.
     if (reference_blending_ && reference_blend_start_ && command_blend_sec_ > 1e-6) {
-      const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - *reference_blend_start_).count();
+      const double elapsed = seconds_since(*reference_blend_start_);
       const double u = std::clamp(elapsed / command_blend_sec_, 0.0, 1.0);
       const double blend = u * u * (3.0 - 2.0 * u);
       const DesiredState & from = reference_blend_from_;
@@ -596,16 +630,35 @@ private:
     d.yaw_rate = heading_norm_sq > 1e-8 ?
       (heading_in_ned.x() * heading_rate_in_ned.y() -
       heading_in_ned.y() * heading_rate_in_ned.x()) / heading_norm_sq : 0.0;
+    // Keep the launch heading while takeoff and hover settling establish lift.
+    // A manual goal may request a large turn, which should start only once the
+    // vehicle is airborne and the planner reference is being tracked.
+    double yaw_target = state_ == ControlState::tracking ? d.yaw : hold_yaw_;
+    if (state_ == ControlState::tracking && manual_yaw_) {
+      const Vector3 manual_heading = rotation_ * Vector3(
+        std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0);
+      yaw_target = std::remainder(
+        std::atan2(manual_heading.y(), manual_heading.x()) + heading_reset_offset_, 2.0 * M_PI);
+    }
+    const auto yaw_now = get_clock()->now();
+    const double yaw_dt = last_yaw_update_ ? std::clamp(
+      (yaw_now - *last_yaw_update_).seconds(), 0.0, 0.05) : 0.0;
+    if (!yaw_setpoint_) {
+      yaw_setpoint_ = std::isfinite(lpos.heading) ? static_cast<double>(lpos.heading) : yaw_target;
+    }
+    const double yaw_step = std::clamp(
+      std::remainder(yaw_target - *yaw_setpoint_, 2.0 * M_PI),
+      -max_yaw_rate_radps_ * yaw_dt, max_yaw_rate_radps_ * yaw_dt);
+    *yaw_setpoint_ = std::remainder(*yaw_setpoint_ + yaw_step, 2.0 * M_PI);
+    last_yaw_update_ = yaw_now;
     if (!command_fresh()) {
-      d.position = p;
       d.velocity.setZero();
       d.acceleration.setZero();
       d.yaw_rate = 0.0;
     } else if (state_ == ControlState::tracking && tracking_handoff_start_time_ &&
       tracking_handoff_sec_ > 1e-6)
     {
-      const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - *tracking_handoff_start_time_).count();
+      const double elapsed = seconds_since(*tracking_handoff_start_time_);
       const double u = std::clamp(elapsed / tracking_handoff_sec_, 0.0, 1.0);
       const double blend = u * u * (3.0 - 2.0 * u);
       d.position = (1.0 - blend) * tracking_handoff_position_ + blend * d.position;
@@ -622,8 +675,8 @@ private:
     if (!integral_enabled || last_output_saturated_) {
       integral_acceleration_ *= 0.995;
     } else {
-      const double dt = last_control_time_ ? std::clamp(std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - *last_control_time_).count(), 0.0, 0.05) : 0.0;
+      const double dt = last_control_time_ ? std::clamp(
+        (get_clock()->now() - *last_control_time_).seconds(), 0.0, 0.05) : 0.0;
       integral_acceleration_ += ki_.cwiseProduct(velocity_error) * dt;
       for (int i = 0; i < 3; ++i) {
         integral_acceleration_(i) = std::clamp(
@@ -638,6 +691,30 @@ private:
     bool saturated = false;
     if (acceleration_norm > max_acceleration_) {
       acceleration *= max_acceleration_ / acceleration_norm;
+      saturated = true;
+    }
+
+    // Project the requested acceleration into the physical thrust/tilt
+    // envelope. Hard-clipping collective thrust after attitude generation
+    // keeps an unreachable acceleration target in the loop and causes large
+    // overshoot when hover thrust is close to the configured maximum.
+    const double max_force = gravity_ * max_thrust_ / hover_thrust_;
+    const double min_force = gravity_ * min_thrust_ / hover_thrust_;
+    const double requested_vertical_force = gravity_ - acceleration.z();
+    const double vertical_force = std::clamp(requested_vertical_force, min_force, max_force);
+    if (std::abs(vertical_force - requested_vertical_force) > 1e-9) saturated = true;
+    acceleration.z() = gravity_ - vertical_force;
+
+    Eigen::Vector2d horizontal_acceleration = acceleration.head<2>();
+    const double horizontal_norm = horizontal_acceleration.norm();
+    const double horizontal_force_from_tilt = std::tan(max_tilt_rad_) * vertical_force;
+    const double horizontal_force_from_thrust = std::sqrt(std::max(
+      0.0, max_force * max_force - vertical_force * vertical_force));
+    const double max_horizontal_acceleration = std::min(
+      horizontal_force_from_tilt, horizontal_force_from_thrust);
+    if (horizontal_norm > max_horizontal_acceleration && horizontal_norm > 1e-9) {
+      horizontal_acceleration *= max_horizontal_acceleration / horizontal_norm;
+      acceleration.head<2>() = horizontal_acceleration;
       saturated = true;
     }
 
@@ -657,18 +734,20 @@ private:
     const double unclamped_thrust = thrust;
     thrust = std::clamp(thrust, min_thrust_, max_thrust_);
     saturated = saturated || std::abs(unclamped_thrust - thrust) > 1e-9;
+    if (saturated) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Acceleration projected into thrust envelope; desired acceleration [%.2f %.2f %.2f] m/s^2",
+        acceleration.x(), acceleration.y(), acceleration.z());
+    }
 
     ControlOutput out;
-    out.attitude = body_z_and_yaw_to_attitude(body_z,
-      manual_yaw_ ? std::atan2(
-        (rotation_ * Vector3(std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0)).y(),
-        (rotation_ * Vector3(std::cos(*manual_yaw_), std::sin(*manual_yaw_), 0.0)).x()) : d.yaw);
+    out.attitude = body_z_and_yaw_to_attitude(body_z, *yaw_setpoint_);
     out.thrust = thrust;
     out.saturated = saturated;
-    out.yaw_rate = std::clamp(manual_yaw_ ? 0.0 : d.yaw_rate,
+    out.yaw_rate = std::clamp(yaw_dt > 1e-6 ? yaw_step / yaw_dt : d.yaw_rate,
       -max_yaw_rate_radps_, max_yaw_rate_radps_);
     last_output_saturated_ = out.saturated;
-    last_control_time_ = std::chrono::steady_clock::now();
+    last_control_time_ = get_clock()->now();
     return out;
   }
 
@@ -682,7 +761,7 @@ private:
     takeoff_origin_z_ = hover_position_.z();
     // PX4 local z is Down, therefore a positive altitude is a negative z target.
     takeoff_target_.z() -= auto_takeoff_altitude_m_;
-    takeoff_start_time_ = std::chrono::steady_clock::now();
+    takeoff_start_time_ = get_clock()->now();
     hover_settle_start_time_.reset();
     state_ = auto_takeoff_altitude_m_ > 1e-3 ? ControlState::takeoff : ControlState::hover;
     publish_status(state_ == ControlState::takeoff ? "state_takeoff" : "state_hover");
@@ -704,35 +783,33 @@ private:
       const bool at_height = (current - takeoff_target_).norm() <= takeoff_tolerance_m_;
       const bool safely_airborne = climb_m >= minimum_takeoff_altitude_m_;
       const bool settled = velocity.norm() <= hover_velocity_tolerance_mps_;
-      const double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - *takeoff_start_time_).count();
+      const double elapsed = seconds_since(*takeoff_start_time_);
       if ((at_height || safely_airborne) && settled && elapsed >= takeoff_duration_sec_) {
         state_ = ControlState::hover;
         hover_position_ = current;
-        hover_settle_start_time_ = std::chrono::steady_clock::now();
+        hover_settle_start_time_ = get_clock()->now();
         publish_status(safely_airborne && !at_height ? "state_hover_minimum_altitude" : "state_hover");
       }
     }
     if (state_ == ControlState::hover) {
-      if (!hover_settle_start_time_) hover_settle_start_time_ = std::chrono::steady_clock::now();
+      if (!hover_settle_start_time_) hover_settle_start_time_ = get_clock()->now();
       if (velocity.norm() > hover_velocity_tolerance_mps_) {
-        hover_settle_start_time_ = std::chrono::steady_clock::now();
+        hover_settle_start_time_ = get_clock()->now();
       }
-      const double settled_for = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - *hover_settle_start_time_).count();
+      const double settled_for = seconds_since(*hover_settle_start_time_);
       if (command_fresh() && pending_desired_ && settled_for >= hover_settle_sec_) {
         state_ = ControlState::tracking;
         desired_ = pending_desired_;
         tracking_handoff_position_ = current;
         tracking_handoff_velocity_ = velocity;
         tracking_handoff_yaw_ = std::isfinite(p.heading) ? static_cast<double>(p.heading) : hold_yaw_;
-        tracking_handoff_start_time_ = std::chrono::steady_clock::now();
+        tracking_handoff_start_time_ = get_clock()->now();
         publish_status("state_tracking");
       }
     }
     if (state_ == ControlState::tracking && !command_fresh()) {
       hover_position_ = current;
-      hover_settle_start_time_ = std::chrono::steady_clock::now();
+      hover_settle_start_time_ = get_clock()->now();
       state_ = ControlState::hover;
       publish_status("state_hover_command_timeout");
     }
@@ -748,13 +825,13 @@ private:
       publish_status("safety_latched_no_setpoint");
       return;
     }
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = get_clock()->now();
     if (!state_fresh()) {
       if (vehicle_status_ && vehicle_status_->arming_state !=
         px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED)
       {
         if (!unhealthy_since_) unhealthy_since_ = now;
-        if (std::chrono::duration<double>(now - *unhealthy_since_).count() >=
+        if (std::max(0.0, (now - *unhealthy_since_).seconds()) >=
           local_position_fault_delay_sec_)
         {
           latch_safety_fault("fastlio_odom_timeout");
@@ -769,7 +846,7 @@ private:
       if (vehicle_status_ && vehicle_status_->arming_state !=
         px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED) {
         if (!unhealthy_since_) unhealthy_since_ = now;
-        if (std::chrono::duration<double>(now - *unhealthy_since_).count() >=
+        if (std::max(0.0, (now - *unhealthy_since_).seconds()) >=
           local_position_fault_delay_sec_)
         {
           latch_safety_fault("px4_local_position_unhealthy");
@@ -786,7 +863,7 @@ private:
 
     update_state_machine();
     if (state_ == ControlState::waiting_for_command) {
-      publish_status("waiting_for_planner_command");
+      publish_status("waiting_for_command_waiting_for_goal");
       return;
     }
     if (state_ == ControlState::hover || state_ == ControlState::takeoff) {
@@ -818,13 +895,12 @@ private:
     setpoint.yaw_sp_move_rate = static_cast<float>(output.yaw_rate);
     setpoint_pub_->publish(setpoint);
     if (!command_seen_ || !start_offboard_ || !vehicle_status_) return;
-    const double elapsed = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - *first_command_time_).count();
+    const double elapsed = seconds_since(*first_command_time_);
     if (elapsed < prestream_seconds_) return;
     if (vehicle_status_->nav_state != px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD) {
       if (retry_due()) {
         publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1.0F, 6.0F);
-        last_command_time_ = std::chrono::steady_clock::now();
+        last_command_time_ = get_clock()->now();
         publish_status("attitude_offboard_requested");
       }
       return;
@@ -833,16 +909,30 @@ private:
         px4_msgs::msg::VehicleStatus::ARMING_STATE_DISARMED &&
         vehicle_status_->pre_flight_checks_pass && retry_due()) {
       publish_vehicle_command(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0F, 0.0F);
-      last_command_time_ = std::chrono::steady_clock::now();
+      last_command_time_ = get_clock()->now();
       publish_status("attitude_offboard_arm_requested");
     }
-    publish_status(command_fresh() ? "attitude_thrust_tracking" : "command_stale_hovering");
+    const std::string phase = control_state_name();
+    publish_status(planner_emergency_hold_ ? phase + "_planner_emergency_hold" :
+      (command_fresh() ? phase + "_attitude_thrust_tracking" :
+      phase + "_command_stale_hovering"));
+  }
+
+  std::string control_state_name() const
+  {
+    switch (state_) {
+      case ControlState::waiting_for_command: return "waiting_for_command";
+      case ControlState::takeoff: return "takeoff";
+      case ControlState::hover: return "hover";
+      case ControlState::tracking: return "tracking";
+      case ControlState::safety_fault: return "safety_fault";
+    }
+    return "unknown";
   }
 
   bool retry_due() const
   {
-    return !last_command_time_ ||
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - *last_command_time_).count() >= 1.0;
+    return !last_command_time_ || seconds_since(*last_command_time_) >= 1.0;
   }
 
   void publish_vehicle_command(uint16_t command, float p1, float p2)
@@ -908,44 +998,47 @@ private:
   Vector3 integral_acceleration_{Vector3::Zero()};
   double integral_enable_velocity_error_mps_{0.60};
   bool last_output_saturated_{false};
-  std::optional<std::chrono::steady_clock::time_point> last_control_time_;
+  std::optional<rclcpp::Time> last_control_time_;
   Matrix3 rotation_{Matrix3::Identity()};
   Vector3 translation_{Vector3::Zero()};
   bool frame_aligned_{false};
   std::optional<Vector3> odom_position_;
   std::optional<Vector3> odom_velocity_;
   std::optional<Eigen::Quaterniond> odom_orientation_;
-  std::optional<std::chrono::steady_clock::time_point> odom_time_;
+  std::optional<rclcpp::Time> odom_time_;
   bool odom_received_{false};
   std::optional<DesiredState> desired_;
   std::optional<DesiredState> reference_target_;
   DesiredState reference_blend_from_;
-  std::optional<std::chrono::steady_clock::time_point> reference_blend_start_;
+  std::optional<rclcpp::Time> reference_blend_start_;
   bool reference_blending_{false};
   std::optional<DesiredState> pending_desired_;
-  std::optional<std::chrono::steady_clock::time_point> desired_command_time_;
-  std::optional<std::chrono::steady_clock::time_point> first_command_time_;
-  std::optional<std::chrono::steady_clock::time_point> last_command_time_;
+  std::optional<rclcpp::Time> desired_command_time_;
+  std::optional<rclcpp::Time> first_command_time_;
+  std::optional<rclcpp::Time> last_command_time_;
   std::optional<double> manual_yaw_;
+  std::optional<double> yaw_setpoint_;
+  std::optional<rclcpp::Time> last_yaw_update_;
   std::optional<px4_msgs::msg::VehicleStatus> vehicle_status_;
   std::optional<px4_msgs::msg::VehicleLocalPosition> local_position_;
-  std::optional<std::chrono::steady_clock::time_point> local_position_time_;
-  std::optional<std::chrono::steady_clock::time_point> unhealthy_since_;
+  std::optional<rclcpp::Time> local_position_time_;
+  std::optional<rclcpp::Time> unhealthy_since_;
   bool local_position_received_{false};
   bool safety_latched_{false};
   bool command_seen_{false};
+  bool planner_emergency_hold_{false};
   ControlState state_{ControlState::waiting_for_command};
   Vector3 hover_position_{Vector3::Zero()};
   Vector3 takeoff_target_{Vector3::Zero()};
   std::optional<double> takeoff_origin_z_;
   double hold_yaw_{0.0};
   double heading_reset_offset_{0.0};
-  std::optional<std::chrono::steady_clock::time_point> takeoff_start_time_;
-  std::optional<std::chrono::steady_clock::time_point> hover_settle_start_time_;
+  std::optional<rclcpp::Time> takeoff_start_time_;
+  std::optional<rclcpp::Time> hover_settle_start_time_;
   Vector3 tracking_handoff_position_{Vector3::Zero()};
   Vector3 tracking_handoff_velocity_{Vector3::Zero()};
   double tracking_handoff_yaw_{0.0};
-  std::optional<std::chrono::steady_clock::time_point> tracking_handoff_start_time_;
+  std::optional<rclcpp::Time> tracking_handoff_start_time_;
   uint64_t px4_timestamp_{0};
   uint64_t last_setpoint_timestamp_{0};
   rclcpp::Subscription<PositionCommand>::SharedPtr command_sub_;
