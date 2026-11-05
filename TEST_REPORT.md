@@ -177,3 +177,13 @@ PX4Ctrl 的输出链路是：EGO `/drone_0_planning/pos_cmd` 的位置、速度�
 本轮验证的是单向跟踪和控制交接，不是障碍物重规划验收；返程和动态障碍仍需在地图有效、目标可达的前提下单独统计。
 
 最后又收紧了姿态设定点时间戳处理：当 PX4 输出时间戳在相邻回调中重复时，只增加 1 微秒维持严格递增，不再每次增加 1 毫秒，从而避免输出流暂时变慢时设定点时钟向未来漂移。修改后 `px4ctrl` 重新构建通过，Python 语法检查和 `git diff --check` 通过。
+
+## 2026-11-05 auto-yaw 与 Z 轴独立复测
+
+从完全停止状态分别重启 SITL 全链路，对 `(0,0,0.5)` 运行 `--auto-yaw` 与固定 90 度航向测试。两轮均保持 armed、Offboard、定位有效，飞行记录中 emergency 计数为 0。auto-yaw 最后 15 秒 Z 误差 RMS 为 1.2 cm，固定航向为 7.3 cm；两轮早期误差主要来自起飞和交接窗口。当前测试未复现 auto-yaw 导致下坠，因此没有依据修改 yaw/Z 控制律。数据与分析见 [`test_results/2026-11-05_auto_yaw_zaxis_analysis.md`](test_results/2026-11-05_auto_yaw_zaxis_analysis.md)，原始记录为同目录下的 `2026-11-05_auto_yaw_zaxis.csv` 和 `2026-11-05_fixed_yaw_zaxis.csv`。旧 `yaw_takeoff_retest.csv` 仍显示异常垂向状态，但其 ULog 未能与 CSV 时间对齐；需用同时包含 EGO 加速度、PX4 实际姿态和估计器 reset 的采集再现，不能据此认定 auto-yaw 是根因。
+
+## 2026-11-06 auto-yaw 返航修复与完整复测
+
+针对 `(0,0,0.5) -> (4,-4,0.5) -> (0,0,0.5)` 的 auto-yaw 返航异常，PX4Ctrl 原先只有 yaw 角速度上限，路径方向反转时角速度会直接跳到 `1.5 rad/s`。已增加 yaw 角加速度限制，并将角速度和姿态四元数按同一平滑斜坡输出；默认最大 yaw 角速度 `0.6 rad/s`、最大角加速度 `0.8 rad/s^2`。采集器补记 EGO 加速度/yaw_dot、PX4 local acceleration、heading/reset counters 和 yaw-rate feed-forward。
+
+在每次全部关闭后分别完成 auto-yaw 和固定 `-83 deg` 航向 round-trip。两轮都到达两个端点并稳定，保持正常 tracking，emergency 为 0，PX4 高度 reset 计数保持不变。auto-yaw 返航端点为 `(0.038,-0.012,0.501)`、速度 `0.026 m/s`；返航最大 `|vz|=0.113 m/s`，无 thrust saturation。固定航向返航端点为 `(-0.011,-0.017,0.492)`、速度 `0.008 m/s`。详细诊断、启动顺序和原始 CSV 见 [`test_results/2026-11-06_auto_yaw_return_analysis.md`](test_results/2026-11-06_auto_yaw_return_analysis.md)。结论仅适用于当前 SITL 全链路，不作为真实飞行调参完成的依据。

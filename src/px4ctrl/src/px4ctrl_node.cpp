@@ -158,7 +158,8 @@ public:
     declare_parameter("command_blend_sec", 0.25);
     declare_parameter("max_command_position_jump_m", 0.35);
     declare_parameter("max_command_velocity_jump_mps", 1.5);
-    declare_parameter("max_yaw_rate_radps", 1.5);
+    declare_parameter("max_yaw_rate_radps", 0.6);
+    declare_parameter("max_yaw_acceleration_radps2", 0.8);
     declare_parameter("kp", std::vector<double>{1.5, 1.5, 1.8});
     declare_parameter("kv", std::vector<double>{1.2, 1.2, 1.4});
     declare_parameter("ki", std::vector<double>{0.10, 0.10, 0.15});
@@ -202,6 +203,7 @@ public:
     max_command_position_jump_m_ = get_parameter("max_command_position_jump_m").as_double();
     max_command_velocity_jump_mps_ = get_parameter("max_command_velocity_jump_mps").as_double();
     max_yaw_rate_radps_ = get_parameter("max_yaw_rate_radps").as_double();
+    max_yaw_acceleration_radps2_ = get_parameter("max_yaw_acceleration_radps2").as_double();
     const auto kp = get_parameter("kp").as_double_array();
     const auto kv = get_parameter("kv").as_double_array();
     const auto ki = get_parameter("ki").as_double_array();
@@ -242,7 +244,8 @@ public:
         !std::isfinite(max_command_position_jump_m_) || max_command_position_jump_m_ <= 0.0 ||
         !std::isfinite(max_command_velocity_jump_mps_) || max_command_velocity_jump_mps_ <= 0.0 ||
         !std::isfinite(integral_enable_velocity_error_mps_) || integral_enable_velocity_error_mps_ <= 0.0 ||
-        !std::isfinite(max_yaw_rate_radps_) || max_yaw_rate_radps_ <= 0.0)
+        !std::isfinite(max_yaw_rate_radps_) || max_yaw_rate_radps_ <= 0.0 ||
+        !std::isfinite(max_yaw_acceleration_radps2_) || max_yaw_acceleration_radps2_ <= 0.0)
     {
       throw std::runtime_error("invalid px4ctrl parameters");
     }
@@ -646,9 +649,22 @@ private:
     if (!yaw_setpoint_) {
       yaw_setpoint_ = std::isfinite(lpos.heading) ? static_cast<double>(lpos.heading) : yaw_target;
     }
-    const double yaw_step = std::clamp(
-      std::remainder(yaw_target - *yaw_setpoint_, 2.0 * M_PI),
-      -max_yaw_rate_radps_ * yaw_dt, max_yaw_rate_radps_ * yaw_dt);
+    double yaw_step = 0.0;
+    if (yaw_dt > 1e-6) {
+      const double yaw_error = std::remainder(yaw_target - *yaw_setpoint_, 2.0 * M_PI);
+      const double desired_yaw_rate = std::clamp(
+        yaw_error / yaw_dt, -max_yaw_rate_radps_, max_yaw_rate_radps_);
+      const double max_yaw_rate_step = max_yaw_acceleration_radps2_ * yaw_dt;
+      yaw_rate_setpoint_ += std::clamp(
+        desired_yaw_rate - yaw_rate_setpoint_, -max_yaw_rate_step, max_yaw_rate_step);
+      yaw_rate_setpoint_ = std::clamp(
+        yaw_rate_setpoint_, -max_yaw_rate_radps_, max_yaw_rate_radps_);
+      yaw_step = yaw_rate_setpoint_ * yaw_dt;
+      if (std::abs(yaw_error) <= std::abs(yaw_step)) {
+        yaw_step = yaw_error;
+        yaw_rate_setpoint_ = 0.0;
+      }
+    }
     *yaw_setpoint_ = std::remainder(*yaw_setpoint_ + yaw_step, 2.0 * M_PI);
     last_yaw_update_ = yaw_now;
     if (!command_fresh()) {
@@ -744,8 +760,7 @@ private:
     out.attitude = body_z_and_yaw_to_attitude(body_z, *yaw_setpoint_);
     out.thrust = thrust;
     out.saturated = saturated;
-    out.yaw_rate = std::clamp(yaw_dt > 1e-6 ? yaw_step / yaw_dt : d.yaw_rate,
-      -max_yaw_rate_radps_, max_yaw_rate_radps_);
+    out.yaw_rate = yaw_rate_setpoint_;
     last_output_saturated_ = out.saturated;
     last_control_time_ = get_clock()->now();
     return out;
@@ -990,7 +1005,8 @@ private:
   double command_blend_sec_{0.25};
   double max_command_position_jump_m_{1.0};
   double max_command_velocity_jump_mps_{1.5};
-  double max_yaw_rate_radps_{1.5};
+  double max_yaw_rate_radps_{0.6};
+  double max_yaw_acceleration_radps2_{0.8};
   Vector3 kp_{1.5, 1.5, 1.8};
   Vector3 kv_{1.2, 1.2, 1.4};
   Vector3 ki_{0.10, 0.10, 0.15};
@@ -1018,6 +1034,7 @@ private:
   std::optional<rclcpp::Time> last_command_time_;
   std::optional<double> manual_yaw_;
   std::optional<double> yaw_setpoint_;
+  double yaw_rate_setpoint_{0.0};
   std::optional<rclcpp::Time> last_yaw_update_;
   std::optional<px4_msgs::msg::VehicleStatus> vehicle_status_;
   std::optional<px4_msgs::msg::VehicleLocalPosition> local_position_;

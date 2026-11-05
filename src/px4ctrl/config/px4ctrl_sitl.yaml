@@ -54,7 +54,9 @@ px4ctrl:
     command_blend_sec: 0.25
     max_command_position_jump_m: 0.35
     max_command_velocity_jump_mps: 1.5
-    max_yaw_rate_radps: 1.5
+    # Smooth 180-degree auto-yaw reversals so attitude/yaw demand does not step.
+    max_yaw_rate_radps: 0.6
+    max_yaw_acceleration_radps2: 0.8
     kp: [1.5, 1.5, 1.8]
     kv: [1.2, 1.2, 1.4]
     # Small steady-state correction, enabled only for small velocity error and
