@@ -1,2 +1,0 @@
-[INFO] [1793884069.838110410] [px4ctrl_track_eval]: saved 3855 samples to /home/thunder/GRA_1/px4ctrl_ws/test_results/2026-11-05_full_stack_regression/roundtrip.csv
-Failed to publish log message to rosout: publisher's context is invalid, at ./src/rcl/publisher.c:423

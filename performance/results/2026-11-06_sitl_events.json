@@ -1,0 +1,94 @@
+{
+  "frame": "lidar",
+  "goal_tolerance_m": 0.25,
+  "speed_tolerance_mps": 0.2,
+  "settle_sec": 2.0,
+  "goals": [
+    {
+      "name": "takeoff_and_hover_baseline",
+      "ready_elapsed_s": 6.310572373000468,
+      "ready_wall_time_unix": 1793953550.1769426,
+      "controller_status": "hover_command_stale_hovering"
+    },
+    {
+      "index": 1,
+      "target_lidar": [
+        4.0,
+        -4.0,
+        0.5
+      ],
+      "start_lidar": [
+        0.09071848971092096,
+        -0.06967949662565298,
+        0.5223446921386621
+      ],
+      "sent_elapsed_s": 6.310693882000123,
+      "sent_wall_time_unix": 1793953550.177064,
+      "result": "reached",
+      "done_elapsed_s": 33.76744500099994,
+      "done_wall_time_unix": 1793953577.6338177,
+      "final_error_m": 0.06805201767239684,
+      "final_speed_mps": 0.10172915672721168
+    },
+    {
+      "index": 2,
+      "target_lidar": [
+        0.0,
+        0.0,
+        0.5
+      ],
+      "start_lidar": [
+        4.000420029357859,
+        -3.93199151040354,
+        0.5023970872806233
+      ],
+      "sent_elapsed_s": 33.76759115300047,
+      "sent_wall_time_unix": 1793953577.6339617,
+      "result": "reached",
+      "done_elapsed_s": 66.10785452300024,
+      "done_wall_time_unix": 1793953609.9742246,
+      "final_error_m": 0.12769299235026765,
+      "final_speed_mps": 0.10437910332804609
+    },
+    {
+      "index": 3,
+      "target_lidar": [
+        4.0,
+        0.0,
+        0.5
+      ],
+      "start_lidar": [
+        0.08472569821035512,
+        -0.09549420907037429,
+        0.4971871025335095
+      ],
+      "sent_elapsed_s": 66.10796494500028,
+      "sent_wall_time_unix": 1793953609.9743323,
+      "result": "reached",
+      "done_elapsed_s": 84.8641505630003,
+      "done_wall_time_unix": 1793953628.7305171,
+      "final_error_m": 0.04247351068872647,
+      "final_speed_mps": 0.10846999260550641
+    },
+    {
+      "index": 4,
+      "target_lidar": [
+        0.0,
+        0.0,
+        0.5
+      ],
+      "start_lidar": [
+        3.9621551890642737,
+        0.019057845878350157,
+        0.5029270985534385
+      ],
+      "sent_elapsed_s": 84.86428354300006,
+      "sent_wall_time_unix": 1793953628.7306516,
+      "result": "reached",
+      "done_elapsed_s": 103.20947536400035,
+      "done_wall_time_unix": 1793953647.0758421,
+      "final_error_m": 0.08123292223649654,
+      "final_speed_mps": 0.06340212522474581
+    }
+  ]
+}
